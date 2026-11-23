@@ -42,208 +42,23 @@
 (defun cdp-message-error (message)
   (%jget (decode-cdp-message message) "error"))
 
-;;; --- tiny JSON (when json-protocol is unbound) -----------------------------
-
-(defun %parse-json (string)
-  (let ((i 0)
-        (n (length string)))
-    (labels ((peek ()
-               (and (< i n) (char string i)))
-             (skip-ws ()
-               (loop while (and (< i n)
-                                (member (char string i)
-                                        '(#\Space #\Tab #\Newline #\Return)))
-                     do (incf i)))
-             (eat (ch)
-               (skip-ws)
-               (unless (eql (peek) ch)
-                 (error 'browser-error
-                        :message (format nil "JSON expected ~s at ~d" ch i)))
-               (incf i))
-             (parse-string ()
-               (eat #\")
-               (let ((out (make-string-output-stream)))
-                 (loop
-                   (let ((ch (peek)))
-                     (cond
-                       ((null ch)
-                        (error 'browser-error :message "unterminated JSON string"))
-                       ((char= ch #\")
-                        (incf i)
-                        (return (get-output-stream-string out)))
-                       ((char= ch #\\)
-                        (incf i)
-                        (let ((esc (or (peek)
-                                       (error 'browser-error
-                                              :message "bad JSON escape"))))
-                          (incf i)
-                          (write-char
-                           (case esc
-                             (#\" #\")
-                             (#\\ #\\)
-                             (#\/ #\/)
-                             (#\b #\Backspace)
-                             (#\f #\Page)
-                             (#\n #\Newline)
-                             (#\r #\Return)
-                             (#\t #\Tab)
-                             (#\u
-                              (if (<= (+ i 4) n)
-                                  (prog1 (or (code-char
-                                              (parse-integer string :start i
-                                                                   :end (+ i 4)
-                                                                   :radix 16))
-                                             #\?)
-                                    (incf i 4))
-                                  #\?))
-                             (t esc))
-                           out)))
-                       (t
-                        (write-char ch out)
-                        (incf i)))))))
-             (parse-number ()
-               (skip-ws)
-               (let ((start i))
-                 (when (eql (peek) #\-) (incf i))
-                 (loop while (and (< i n) (digit-char-p (char string i)))
-                       do (incf i))
-                 (when (eql (peek) #\.)
-                   (incf i)
-                   (loop while (and (< i n) (digit-char-p (char string i)))
-                         do (incf i)))
-                 (when (and (< i n) (member (char string i) '(#\e #\E)))
-                   (incf i)
-                   (when (member (peek) '(#\+ #\-)) (incf i))
-                   (loop while (and (< i n) (digit-char-p (char string i)))
-                         do (incf i)))
-                 (let ((token (subseq string start i)))
-                   (if (find-if (lambda (c) (member c '(#\. #\e #\E))) token)
-                       (read-from-string token)
-                       (parse-integer token)))))
-             (parse-array ()
-               (eat #\[)
-               (skip-ws)
-               (if (eql (peek) #\])
-                   (progn (incf i) (vector))
-                   (let ((items '()))
-                     (loop
-                       (push (parse-value) items)
-                       (skip-ws)
-                       (cond
-                         ((eql (peek) #\])
-                          (incf i)
-                          (return (map 'vector #'identity (nreverse items))))
-                         ((eql (peek) #\,) (incf i))
-                         (t (error 'browser-error
-                                   :message "bad JSON array")))))))
-             (parse-object ()
-               (eat #\{)
-               (skip-ws)
-               (let ((h (make-hash-table :test 'equal)))
-                 (when (eql (peek) #\})
-                   (incf i)
-                   (return-from parse-object h))
-                 (loop
-                   (skip-ws)
-                   (let ((k (parse-string)))
-                     (skip-ws)
-                     (eat #\:)
-                     (setf (gethash k h) (parse-value)))
-                   (skip-ws)
-                   (cond
-                     ((eql (peek) #\}) (incf i) (return h))
-                     ((eql (peek) #\,) (incf i))
-                     (t (error 'browser-error :message "bad JSON object"))))))
-             (parse-literal (lit value)
-               (when (and (<= (+ i (length lit)) n)
-                          (string= string lit :start1 i :end1 (+ i (length lit))))
-                 (incf i (length lit))
-                 value))
-             (parse-value ()
-               (skip-ws)
-               (case (peek)
-                 (#\" (parse-string))
-                 (#\{ (parse-object))
-                 (#\[ (parse-array))
-                 (#\t (or (parse-literal "true" t)
-                          (error 'browser-error :message "bad JSON true")))
-                 (#\f (or (parse-literal "false" nil)
-                          (error 'browser-error :message "bad JSON false")))
-                 (#\n (or (parse-literal "null" :null)
-                          (error 'browser-error :message "bad JSON null")))
-                 (t
-                  (if (or (eql (peek) #\-) (and (peek) (digit-char-p (peek))))
-                      (parse-number)
-                      (error 'browser-error
-                             :message (format nil "bad JSON at ~d" i)))))))
-      (let ((value (parse-value)))
-        (skip-ws)
-        value))))
-
-;;; --- base64 (RFC 4648) for screenshot / PDF data ---------------------------
-
-(defparameter +b64-alphabet+
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+;;; --- octets: screenshot / PDF data is base64 (encoding-protocol) -------------
 
 (defun %usb8 (seq)
   (coerce seq '(simple-array (unsigned-byte 8) (*))))
 
-(defun %base64-encode (octets)
-  (let* ((octets (%usb8 octets))
-         (n (length octets))
-         (out (make-string (* 4 (ceiling n 3)) :initial-element #\=)))
-    (loop with j = 0
-          for i from 0 below n by 3
-          for b0 = (aref octets i)
-          for b1 = (if (< (1+ i) n) (aref octets (1+ i)) 0)
-          for b2 = (if (< (+ i 2) n) (aref octets (+ i 2)) 0)
-          for triple = (logior (ash b0 16) (ash b1 8) b2)
-          do (setf (char out j) (char +b64-alphabet+ (ldb (byte 6 18) triple))
-                   (char out (1+ j)) (char +b64-alphabet+ (ldb (byte 6 12) triple)))
-             (when (< (1+ i) n)
-               (setf (char out (+ j 2))
-                     (char +b64-alphabet+ (ldb (byte 6 6) triple))))
-             (when (< (+ i 2) n)
-               (setf (char out (+ j 3))
-                     (char +b64-alphabet+ (ldb (byte 6 0) triple))))
-             (incf j 4))
-    out))
-
-(defun %b64-value (ch)
-  (cond
-    ((char<= #\A ch #\Z) (- (char-code ch) (char-code #\A)))
-    ((char<= #\a ch #\z) (+ 26 (- (char-code ch) (char-code #\a))))
-    ((char<= #\0 ch #\9) (+ 52 (- (char-code ch) (char-code #\0))))
-    ((char= ch #\+) 62)
-    ((char= ch #\/) 63)
-    (t nil)))
-
-(defun %base64-decode (string)
-  (let* ((chars (remove-if (lambda (c)
-                             (member c '(#\= #\Space #\Newline #\Return #\Tab)))
-                           string))
-         (n (length chars))
-         (out (make-array (* 3 (ceiling n 4))
-                          :element-type '(unsigned-byte 8)
-                          :fill-pointer 0)))
-    (loop for i from 0 below n by 4
-          for v0 = (or (%b64-value (char chars i)) 0)
-          for v1 = (if (< (1+ i) n) (or (%b64-value (char chars (1+ i))) 0) 0)
-          for v2 = (if (< (+ i 2) n) (or (%b64-value (char chars (+ i 2))) 0) 0)
-          for v3 = (if (< (+ i 3) n) (or (%b64-value (char chars (+ i 3))) 0) 0)
-          for triple = (logior (ash v0 18) (ash v1 12) (ash v2 6) v3)
-          do (vector-push (ldb (byte 8 16) triple) out)
-             (when (< (+ i 2) n) (vector-push (ldb (byte 8 8) triple) out))
-             (when (< (+ i 3) n) (vector-push (ldb (byte 8 0) triple) out)))
-    (coerce out '(simple-array (unsigned-byte 8) (*)))))
-
 (defun %octets-from-b64 (value)
   (cond
-    ((null value) (make-array 0 :element-type '(unsigned-byte 8)))
-    ((and (vectorp value) (not (stringp value))) (%usb8 value))
-    ((stringp value) (%base64-decode value))
-    (t (error 'browser-error
-              :message (format nil "not base64/octets: ~s" (type-of value))))))
+   ((null value) (make-array 0 :element-type '(unsigned-byte 8)))
+   ((and (vectorp value) (not (stringp value))) (%usb8 value))
+   ((stringp value)
+    (handler-case (%usb8 (encoding-protocol:decode value :encoding :base64))
+      (encoding-protocol:encoding-error (c)
+        (error 'browser-error
+               :message (format nil "bad base64 from the browser: ~a" c)
+               :cause c))))
+   (t (error 'browser-error
+             :message (format nil "not base64/octets: ~s" (type-of value))))))
 
 (defun %js-string (value)
   (with-output-to-string (s)
@@ -266,23 +81,35 @@
    (session-id :initarg :session-id :accessor cdp-session-id :initform nil)
    (ws-url :initarg :ws-url :accessor cdp-ws-url :initform nil)
    (connected-p :initarg :connected-p :accessor cdp-connected-p :initform nil)
-   (targets :initarg :targets :accessor cdp-targets :initform nil))
+   (targets :initarg :targets :accessor cdp-targets :initform nil)
+   (timeout :initarg :timeout :accessor cdp-timeout :initform 30
+            :documentation "Seconds a command (or NAVIGATE's wait) may take.")
+   (events :initform '() :accessor %cdp-events
+           :documentation "Events read while waiting for replies, oldest first.")
+   (handlers :initform (make-hash-table :test 'equal) :accessor %cdp-handlers
+             :documentation "Event method → list of ON-CDP-EVENT handlers.")
+   (page-enabled-p :initform nil :accessor %cdp-page-enabled-p))
   (:documentation
    "Builds CDP commands and exchanges them via SEND-FN / RECV-FN.
-    SEND-FN is called with a command hash-table; RECV-FN returns a message."))
+    SEND-FN is called with a command hash-table; RECV-FN returns the next
+    message (hash-table, plist or JSON text) and should give up after
+    *CDP-RECEIVE-TIMEOUT* seconds with BROWSER-TIMEOUT. Replies are matched
+    to commands by id; events in between go to ON-CDP-EVENT handlers and a
+    bounded buffer that WAIT-FOR-CDP-EVENT reads."))
 
 (defun cdp-browser-backend-p (object)
   (typep object 'cdp-browser-backend))
 
 (defun make-cdp-browser-backend (&key send-fn recv-fn compute-backend
-                                   sandbox-spec ws-url session-id)
+                                      sandbox-spec ws-url session-id (timeout 30))
   (make-instance 'cdp-browser-backend
                  :send-fn send-fn
                  :recv-fn recv-fn
                  :compute-backend compute-backend
                  :sandbox-spec sandbox-spec
                  :ws-url ws-url
-                 :session-id session-id))
+                 :session-id session-id
+                 :timeout timeout))
 
 (defun use-cdp-browser-backend (&rest args &key &allow-other-keys)
   (setf *browser-backend* (apply #'make-cdp-browser-backend args)))
@@ -292,21 +119,152 @@
     (error 'browser-disconnected
            :message "CDP send-fn/recv-fn missing — no websocket")))
 
-(defun cdp-call (backend method &optional params)
+(defvar *cdp-receive-timeout* nil
+  "Seconds left for the RECV-FN call in progress, or NIL for no limit. Bound
+   around every RECV-FN call: a transport that can wait with a timeout
+   signals BROWSER-TIMEOUT once it passes.")
+
+(defparameter *cdp-event-buffer-limit* 1000
+  "Events kept per backend for WAIT-FOR-CDP-EVENT; older ones are dropped.")
+
+(defun %deadline (seconds)
+  (and seconds
+       (+ (get-internal-real-time)
+          (round (* seconds internal-time-units-per-second)))))
+
+(defun %seconds-left (deadline)
+  (and deadline
+       (/ (- deadline (get-internal-real-time)) internal-time-units-per-second)))
+
+(defun %cdp-receive (backend deadline limit what)
+  "Next message from RECV-FN as a hash-table. BROWSER-TIMEOUT once DEADLINE
+   (LIMIT seconds after the start) passes; BROWSER-DISCONNECTED when RECV-FN
+   returns NIL."
+  (let ((left (%seconds-left deadline)))
+    (when (and left (<= left 0))
+      (error 'browser-timeout
+             :method what :limit limit
+             :message (format nil "nothing for ~a within ~as" what limit)))
+    (let ((raw (let ((*cdp-receive-timeout* left))
+                 (funcall (cdp-recv-fn backend)))))
+      (when (null raw)
+        (error 'browser-disconnected
+               :method what :message "the CDP transport is closed"))
+      (decode-cdp-message raw))))
+
+(defun %cdp-own-session-p (backend message)
+  "MESSAGE has no sessionId (browser target, or a page connection) or
+   BACKEND's."
+  (let ((session (%jget message "sessionId")))
+    (or (null session) (equal session (cdp-session-id backend)))))
+
+(defun %cdp-dispatch (backend message)
+  (let ((params (or (cdp-message-params message) (%ht))))
+    (dolist (handler (reverse (gethash (cdp-message-method message)
+                                       (%cdp-handlers backend))))
+      (funcall handler params))))
+
+(defun %cdp-note-event (backend message)
+  "Hand MESSAGE (an event) to its handlers, then keep it in the buffer."
+  (%cdp-dispatch backend message)
+  (let* ((events (nconc (%cdp-events backend) (list message)))
+         (excess (- (length events) *cdp-event-buffer-limit*)))
+    (setf (%cdp-events backend)
+          (if (plusp excess) (nthcdr excess events) events))))
+
+(defun %cdp-reply-result (message method)
+  (let ((err (cdp-message-error message)))
+    (when err
+      (error 'browser-error
+             :method method
+             :message (format nil "~a~@[ (~a)~]"
+                              (or (%jget err "message") (princ-to-string err))
+                              (%jget err "data")))))
+  (cdp-message-result message))
+
+(defun %cdp-command (backend method params session-id timeout)
+  "Send one command (on SESSION-ID, NIL = the connection's own target) and
+   read until the reply with its id. Replies to other ids (commands given
+   up on) are dropped; events are noted."
   (%cdp-ensure-io backend)
   (let* ((id (incf (cdp-next-id backend)))
-         (cmd (encode-cdp-command id method params)))
-    (when (cdp-session-id backend)
-      (setf (gethash "sessionId" cmd) (cdp-session-id backend)))
+         (cmd (encode-cdp-command id method params))
+         (limit (or timeout (cdp-timeout backend)))
+         (deadline (%deadline limit)))
+    (when session-id
+      (setf (gethash "sessionId" cmd) session-id))
     (funcall (cdp-send-fn backend) cmd)
-    (let ((msg (decode-cdp-message (funcall (cdp-recv-fn backend)))))
-      (let ((err (cdp-message-error msg)))
-        (when err
-          (error 'browser-error
-                 :method method
-                 :message (or (%jget err "message")
-                              (princ-to-string err)))))
-      (cdp-message-result msg))))
+    (loop
+      (let ((msg (%cdp-receive backend deadline limit method)))
+        (cond
+         ((eql id (cdp-message-id msg))
+          (return (%cdp-reply-result msg method)))
+         ((cdp-message-method msg)
+          (%cdp-note-event backend msg)))))))
+
+(defun %cdp-browser-call (backend method &optional params timeout)
+  "CDP-CALL on the browser target: no sessionId."
+  (%cdp-command backend method params nil timeout))
+
+(defun on-cdp-event (backend method handler)
+  "Call HANDLER with the params (hash-table) of every METHOD event BACKEND
+   reads. Events are read while a command waits for its reply or
+   WAIT-FOR-CDP-EVENT waits, on that thread. → HANDLER."
+  (check-type method string)
+  (push handler (gethash method (%cdp-handlers backend)))
+  handler)
+
+(defun off-cdp-event (backend method &optional handler)
+  "Remove HANDLER (every handler when NIL) for METHOD events."
+  (if handler
+      (setf (gethash method (%cdp-handlers backend))
+            (remove handler (gethash method (%cdp-handlers backend))))
+      (remhash method (%cdp-handlers backend)))
+  nil)
+
+(defun %event-matches-p (backend message method test)
+  (and (equal method (cdp-message-method message))
+       (%cdp-own-session-p backend message)
+       (or (null test)
+           (funcall test (or (cdp-message-params message) (%ht))))))
+
+(defun %cdp-forget-events (backend method)
+  "Drop buffered METHOD events of BACKEND's session (stale for a new wait)."
+  (setf (%cdp-events backend)
+        (remove-if (lambda (m) (%event-matches-p backend m method nil))
+                   (%cdp-events backend))))
+
+(defun wait-for-cdp-event (backend method &key test timeout)
+  "→ the params of the first METHOD event of BACKEND's session for which
+   TEST (if given) is true of the params. Takes it from the event buffer,
+   else reads the transport. BROWSER-TIMEOUT after TIMEOUT seconds (default
+   (CDP-TIMEOUT BACKEND))."
+  (check-type method string)
+  (let ((buffered (find-if (lambda (m) (%event-matches-p backend m method test))
+                           (%cdp-events backend))))
+    (when buffered
+      (setf (%cdp-events backend) (remove buffered (%cdp-events backend) :count 1))
+      (return-from wait-for-cdp-event
+        (or (cdp-message-params buffered) (%ht)))))
+  (%cdp-ensure-io backend)
+  (let* ((limit (or timeout (cdp-timeout backend)))
+         (deadline (%deadline limit)))
+    (loop
+      (let ((msg (%cdp-receive backend deadline limit method)))
+        (when (cdp-message-method msg)
+          (cond
+           ((%event-matches-p backend msg method test)
+            (%cdp-dispatch backend msg)
+            (return (or (cdp-message-params msg) (%ht))))
+           (t (%cdp-note-event backend msg))))))))
+
+(defun cdp-call (backend method &optional params)
+  "Send METHOD with PARAMS (hash-table, plist or alist) on BACKEND's session.
+   → the reply's result (hash-table). Events that arrive first go to the
+   ON-CDP-EVENT handlers and the event buffer. A CDP error reply signals
+   BROWSER-ERROR; no reply within (CDP-TIMEOUT BACKEND) seconds signals
+   BROWSER-TIMEOUT."
+  (%cdp-command backend method params (cdp-session-id backend) nil))
 
 (defun %eval-result (result)
   (or (%jget result "result") result))
@@ -330,9 +288,47 @@
               "window")
           (or dx 0) (or dy 0)))
 
-(defmethod navigate ((backend cdp-browser-backend) url)
-  (cdp-call backend "Page.navigate" (%ht "url" url))
-  url)
+(defparameter +navigate-wait-events+
+  '((:load . "Page.loadEventFired")
+    (:domcontentloaded . "Page.domContentEventFired"))
+  "NAVIGATE :wait-until → the Page event that ends the wait.")
+
+(defun %ensure-page-events (backend)
+  "Page.enable once per backend: without it Chrome sends no Page events."
+  (unless (%cdp-page-enabled-p backend)
+    (cdp-call backend "Page.enable")
+    (setf (%cdp-page-enabled-p backend) t)))
+
+(defmethod navigate ((backend cdp-browser-backend) url &key (wait-until :load) timeout)
+  (let* ((event (cond
+                 ((member wait-until '(nil :commit)) nil)
+                 ((cdr (assoc wait-until +navigate-wait-events+)))
+                 (t (error 'browser-error
+                           :url url :method "Page.navigate"
+                           :message (format nil "wait-until ~s: want :load, :domcontentloaded or :commit"
+                                            wait-until)))))
+         (limit (or timeout (cdp-timeout backend)))
+         (deadline (%deadline limit)))
+    (when event
+      (%ensure-page-events backend)
+      (%cdp-forget-events backend event))
+    (let* ((result (%cdp-command backend "Page.navigate" (%ht "url" url)
+                                 (cdp-session-id backend) limit))
+           (error-text (%jget result "errorText")))
+      (when (and (stringp error-text) (plusp (length error-text)))
+        (error 'browser-error
+               :url url :method "Page.navigate"
+               :message (format nil "navigation to ~a failed: ~a" url error-text)))
+      ;; No loaderId: a same-document navigation (#fragment) fires no load event.
+      (when (and event (%jget result "loaderId") (not (%jget result "isDownload")))
+        (handler-case
+            (wait-for-cdp-event backend event
+                                :timeout (and deadline (max 0 (%seconds-left deadline))))
+          (browser-timeout (c)
+            (error 'browser-timeout
+                   :url url :method "Page.navigate" :limit limit :cause c
+                   :message (format nil "~a: no ~a within ~as" url event limit)))))
+      url)))
 
 (defmethod dom-snapshot ((backend cdp-browser-backend))
   (%value-of
@@ -387,13 +383,15 @@
   (when url
     (setf (cdp-ws-url backend) (or ws-url url)))
   (%cdp-ensure-io backend)
-  (cdp-call backend "Target.setDiscoverTargets" (%ht "discover" t))
+  ;; A browser-target command: Target.* events then reach every session.
+  (%cdp-browser-call backend "Target.setDiscoverTargets" (%ht "discover" t))
   (setf (cdp-connected-p backend) t)
   backend)
 
 (defmethod close-browser ((backend cdp-browser-backend))
   (when (and (cdp-send-fn backend) (cdp-recv-fn backend))
-    (handler-case (cdp-call backend "Browser.close")
+    ;; Chrome may close the socket before it replies.
+    (handler-case (%cdp-browser-call backend "Browser.close" nil 5)
       (browser-error () nil)))
   (setf (cdp-connected-p backend) nil)
   t)
@@ -411,7 +409,7 @@
     (t (error 'browser-error :message (format nil "not a target: ~s" item)))))
 
 (defmethod list-targets ((backend cdp-browser-backend))
-  (let* ((result (cdp-call backend "Target.getTargets"))
+  (let* ((result (%cdp-browser-call backend "Target.getTargets"))
          (raw (or (%jget result "targetInfos")
                   (%jget result "targetInfo")
                   result)))

@@ -1,11 +1,12 @@
 (defsystem "browser-protocol"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "CLOS browser protocol for cl-stack (CDP client + computer-use loop)"
   :author "egao1980"
   :license "MIT"
-  :depends-on ("llm-protocol")
+  ;; CDP JSON and screenshot / PDF base64 go through the stack protocols (#1).
+  :depends-on ("llm-protocol" "json-protocol" "json-backend-jzon" "encoding-protocol")
   :properties (:cl-repo
-               (:ci (:with ("browser-protocol/capability"))))
+               (:ci (:with ("browser-protocol/capability" "browser-protocol/launch"))))
   :serial t
   :pathname "src"
   :components ((:file "package")
@@ -16,8 +17,19 @@
                (:file "computer-use"))
   :in-order-to ((test-op (test-op "browser-protocol/tests"))))
 
+(defsystem "browser-protocol/launch"
+  :version "0.2.0"
+  :description "Launch / connect Chrome, Chromium or Edge over CDP (ws-protocol + process-protocol)"
+  :author "egao1980"
+  :license "MIT"
+  :depends-on ("browser-protocol" "ws-protocol" "ws-backend-websocket-driver"
+               "process-protocol" "process-backend-uiop" "bordeaux-threads")
+  :pathname "src"
+  :components ((:file "launch"))
+  :in-order-to ((test-op (test-op "browser-protocol/tests"))))
+
 (defsystem "browser-protocol/capability"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "capability-protocol :world adapter over browser-protocol"
   :author "egao1980"
   :license "MIT"
@@ -30,7 +42,10 @@
 (defsystem "browser-protocol/tests"
   :depends-on ("browser-protocol"
                "browser-protocol/capability"
+               "browser-protocol/launch"
                "llm-protocol"
+               "json-protocol"
+               "process-protocol"
                "rove")
   :pathname "tests"
   :serial t
@@ -43,7 +58,9 @@
                ;; Evidence for #1 (private JSON / base64) and #2 (launch, ids, load).
                (:file "stack-json-test")
                (:file "cdp-session-test")
-               (:file "launch-test"))
+               (:file "launch-test")
+               ;; Defender edge cases: ids, events, navigate wait, JSON errors.
+               (:file "cdp-events-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

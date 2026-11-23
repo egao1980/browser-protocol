@@ -5,6 +5,7 @@
            #:browser-error-message
            #:browser-error-url
            #:browser-error-method
+           #:browser-error-cause
            #:browser-timeout
            #:browser-timeout-limit
            #:browser-disconnected
@@ -55,6 +56,26 @@
            #:cdp-recv-fn
            #:cdp-session-id
            #:cdp-ws-url
+           #:cdp-timeout
+           #:cdp-call
+           #:on-cdp-event
+           #:off-cdp-event
+           #:wait-for-cdp-event
+           #:*cdp-receive-timeout*
+           #:*cdp-event-buffer-limit*
+
+           ;; browser-protocol/launch
+           #:launch-browser
+           #:with-browser
+           #:connect-cdp
+           #:find-browser-executable
+           #:*browser-executable-candidates*
+           #:*browser-executable-names*
+           #:chrome-browser-backend
+           #:chrome-browser-backend-p
+           #:chrome-browser-process
+           #:chrome-browser-profile
+           #:chrome-browser-target-id
 
            #:mock-browser-backend
            #:mock-browser-backend-p

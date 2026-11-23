@@ -35,8 +35,8 @@
          :name 'computer-use :params '((goal t)) :returns t
          :doc "Computer-use loop.")))
 
-(defmethod navigate ((cap browser-adapter) url)
-  (navigate (%cap-backend cap) url))
+(defmethod navigate ((cap browser-adapter) url &key (wait-until :load) timeout)
+  (navigate (%cap-backend cap) url :wait-until wait-until :timeout timeout))
 
 (defmethod screenshot ((cap browser-adapter) &key)
   (screenshot (%cap-backend cap)))

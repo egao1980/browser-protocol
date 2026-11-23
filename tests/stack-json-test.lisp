@@ -21,16 +21,50 @@
           (ok (and present (member value '(nil :false)))
               (format nil "isDownload is false, got ~s" value)))))))
 
+(defun %json-text-chrome ()
+  "SEND-FN / RECV-FN of a websocket: commands leave as JSON text, Chrome's
+   answers come back as JSON text. Replies carry the command's id, as Chrome's
+   do; Page.navigate answers with the verbatim *CHROME-NAVIGATE-REPLY* and then
+   Page.loadEventFired."
+  (let ((queue '()))
+    (values
+     (lambda (cmd)
+       (let* ((text (json-protocol:encode cmd))
+              (msg (json-protocol:decode text))
+              (id (gethash "id" msg)))
+         (setf queue
+               (append queue
+                       (if (equal "Page.navigate" (gethash "method" msg))
+                           (list (format nil "{\"id\":~d~a" id
+                                         (subseq *chrome-navigate-reply*
+                                                 (length "{\"id\":1")))
+                                 "{\"method\":\"Page.loadEventFired\",\"params\":{\"timestamp\":2.5}}")
+                           (list (format nil "{\"id\":~d,\"result\":{}}" id)))))))
+     (lambda ()
+       (or (pop queue)
+           (error 'browser-protocol:browser-timeout :message "nothing pending"))))))
+
 (deftest navigate-over-a-json-text-transport
   ;; A websocket hands RECV-FN JSON text. With browser-protocol 0.1.0 against
   ;; real Chrome: BROWSER-ERROR "bad JSON false".
+  ;; Defender (0.2.0): NAVIGATE now sends Page.enable and waits for the load
+  ;; event (#2), so a RECV-FN that returns the id-1 reply forever cannot
+  ;; answer it; the first case keeps that transport with :wait-until :commit
+  ;; (one command, id 1), the second answers like Chrome.
   (let* ((b (browser-protocol:make-cdp-browser-backend
              :send-fn (lambda (cmd) (declare (ignore cmd)))
              :recv-fn (lambda () *chrome-navigate-reply*)))
-         (got (handler-case (browser-protocol:navigate b "data:text/html,<title>x</title>")
+         (got (handler-case (browser-protocol:navigate b "data:text/html,<title>x</title>"
+                                                       :wait-until :commit)
                 (error (c) (format nil "~a: ~a" (type-of c) c)))))
     (ok (equal "data:text/html,<title>x</title>" got)
-        (format nil "navigate returned ~s" got))))
+        (format nil "navigate returned ~s" got)))
+  (multiple-value-bind (send recv) (%json-text-chrome)
+    (let* ((b (browser-protocol:make-cdp-browser-backend :send-fn send :recv-fn recv))
+           (got (handler-case (browser-protocol:navigate b "data:text/html,<title>x</title>")
+                  (error (c) (format nil "~a: ~a" (type-of c) c)))))
+      (ok (equal "data:text/html,<title>x</title>" got)
+          (format nil "navigate (wait for load) returned ~s" got)))))
 
 (deftest depends-on-stack-json-and-encoding
   ;; AGENTS.md "Own stack first": stack protocols are always allowed

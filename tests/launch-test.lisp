@@ -55,3 +55,56 @@
                 (ok (equal "complete" (browser-protocol:eval-js b "document.readyState")))
                 (ok (equal 2 (browser-protocol:eval-js b "1+1"))))
            (browser-protocol:close-browser b)))))))
+
+;;; Defender edge cases (real browser; skipped without one).
+
+(defmacro with-real-browser ((var &rest options) &body body)
+  `(if (null (%chrome-executable))
+       (skip "no Chrome/Chromium (set CHROME_PATH)")
+       (browser-protocol:with-browser (,var ,@options)
+         ,@body)))
+
+(deftest with-browser-binds-and-cleans-up
+  (let ((seen nil) (process nil) (profile nil))
+    (with-real-browser (b)
+      (setf seen (eq b browser-protocol:*browser-backend*)
+            process (browser-protocol:chrome-browser-process b)
+            profile (browser-protocol:chrome-browser-profile b))
+      ;; *BROWSER-BACKEND* serves the NIL-backend methods.
+      (ok (equal 7 (browser-protocol:eval-js nil "3+4"))))
+    (when process
+      (ok seen "*browser-backend* is the launched backend inside WITH-BROWSER")
+      (ok (not (stack-process:alive-p process)) "browser process stopped")
+      (ok (not (probe-file profile)) "temporary profile removed"))))
+
+(deftest real-browser-screenshot-dom-and-errors
+  (with-real-browser (b)
+    (browser-protocol:navigate b "data:text/html,<title>shot</title><p id=p>hello</p>")
+    (let ((png (browser-protocol:screenshot b)))
+      (ok (equalp #(137 80 78 71) (subseq png 0 4)) "screenshot is a PNG"))
+    (ok (search "<p id=\"p\">hello</p>" (browser-protocol:dom-snapshot b)))
+    (let ((pdf (browser-protocol:print-pdf b)))
+      (ok (equalp (map 'vector #'char-code "%PDF") (subseq pdf 0 4)) "print-pdf is a PDF"))
+    (handler-case (progn (browser-protocol:navigate b "http://no-such-host.invalid/")
+                         (ok nil "no error for an unresolvable host"))
+      (browser-protocol:browser-error (c)
+        (ok (search "ERR_NAME_NOT_RESOLVED" (princ-to-string c)) (princ-to-string c))))
+    ;; Same-document navigation: no load event, NAVIGATE still returns.
+    (browser-protocol:navigate b "data:text/html,<title>frag</title><p id=x>x</p>")
+    (ok (equal "about:blank#x"
+               (progn (browser-protocol:navigate b "about:blank")
+                      (browser-protocol:navigate b "about:blank#x")
+                      (browser-protocol:eval-js b "location.href"))))))
+
+(deftest connect-cdp-detaches-and-leaves-the-browser-running
+  (with-real-browser (b)
+    (let ((other (browser-protocol:connect-cdp (browser-protocol:cdp-ws-url b))))
+      (ok (equal 2 (browser-protocol:eval-js other "1+1")))
+      (browser-protocol:close-browser other)
+      (ok (stack-process:alive-p (browser-protocol:chrome-browser-process b)))
+      (ok (equal 4 (browser-protocol:eval-js b "2+2")) "the launched backend still works"))))
+
+(deftest launch-browser-missing-executable
+  ;; No browser needed: a missing program is a BROWSER-ERROR, not a hang.
+  (ok (signals (browser-protocol:launch-browser :executable "/nonexistent/chrome" :timeout 5)
+               'browser-protocol:browser-error)))
