@@ -60,7 +60,8 @@
                (:file "cdp-session-test")
                (:file "launch-test")
                ;; Defender edge cases: ids, events, navigate wait, JSON errors.
-               (:file "cdp-events-test"))
+               (:file "cdp-events-test")
+               (:file "cdp-reentrancy-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
