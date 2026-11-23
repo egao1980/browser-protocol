@@ -39,7 +39,11 @@
                (:file "cdp-test")
                (:file "computer-use-test")
                (:file "restarts-test")
-               (:file "capability-test"))
+               (:file "capability-test")
+               ;; Evidence for #1 (private JSON / base64) and #2 (launch, ids, load).
+               (:file "stack-json-test")
+               (:file "cdp-session-test")
+               (:file "launch-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
