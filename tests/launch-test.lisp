@@ -13,7 +13,8 @@
 
 (defun %chrome-executable ()
   "The browser LAUNCH-BROWSER with no arguments is expected to find too:
-   CHROME_PATH first, then the usual install locations."
+   CHROME_PATH first, then the usual install locations. Defender: also ask
+   FIND-BROWSER-EXECUTABLE, which knows the Windows install paths."
   (let ((env (uiop:getenv "CHROME_PATH")))
     (or (and env (plusp (length env)) (probe-file env) env)
         (find-if #'probe-file
@@ -26,7 +27,9 @@
                                         (uiop:run-program (list "sh" "-c" (format nil "command -v ~a" name))
                                                           :output :string)))
               when (and path (plusp (length path)))
-                return path))))
+                return path)
+        (let ((find (%browser-fn "FIND-BROWSER-EXECUTABLE")))
+          (and find (funcall find))))))
 
 (defun %browser-fn (name)
   (let ((s (find-symbol name :browser-protocol)))
