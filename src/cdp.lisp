@@ -85,17 +85,37 @@
    (timeout :initarg :timeout :accessor cdp-timeout :initform 30
             :documentation "Seconds a command (or NAVIGATE's wait) may take.")
    (events :initform '() :accessor %cdp-events
-           :documentation "Events read while waiting for replies, oldest first.")
+           :documentation "Events read so far, oldest first (at most
+            *CDP-EVENT-BUFFER-LIMIT*). Replaced, never modified in place.")
    (handlers :initform (make-hash-table :test 'equal) :accessor %cdp-handlers
              :documentation "Event method → list of ON-CDP-EVENT handlers.")
-   (page-enabled-p :initform nil :accessor %cdp-page-enabled-p))
+   (page-enabled-p :initform nil :accessor %cdp-page-enabled-p)
+   (replies :initform (make-hash-table) :reader %cdp-replies
+            :documentation "Id → :WAITING, or its reply, for each command in flight.")
+   (reader :initform nil :accessor %cdp-reader
+           :documentation "The thread inside RECV-FN, or NIL.")
+   (generation :initform 0 :accessor %cdp-generation
+               :documentation "Counts messages filed and reads ended, so a
+                waiter sees whether anything changed since it looked.")
+   (lock :initform (bt2:make-lock :name "browser-protocol cdp") :reader %cdp-lock
+         :documentation "Guards the slots above. Never held while RECV-FN,
+          SEND-FN, a handler or a TEST runs.")
+   (filed :initform (bt2:make-condition-variable :name "browser-protocol cdp filed")
+          :reader %cdp-filed
+          :documentation "Notified when the reading thread files a message.")
+   (send-lock :initform (bt2:make-lock :name "browser-protocol cdp send")
+              :reader %cdp-send-lock
+              :documentation "One SEND-FN call at a time."))
   (:documentation
    "Builds CDP commands and exchanges them via SEND-FN / RECV-FN.
     SEND-FN is called with a command hash-table; RECV-FN returns the next
     message (hash-table, plist or JSON text) and should give up after
-    *CDP-RECEIVE-TIMEOUT* seconds with BROWSER-TIMEOUT. Replies are matched
-    to commands by id; events in between go to ON-CDP-EVENT handlers and a
-    bounded buffer that WAIT-FOR-CDP-EVENT reads."))
+    *CDP-RECEIVE-TIMEOUT* seconds with BROWSER-TIMEOUT. One thread at a time
+    calls RECV-FN, and it files what it reads: a reply goes to the command
+    waiting for its id, an event to the ON-CDP-EVENT handlers and a bounded
+    buffer that WAIT-FOR-CDP-EVENT reads. So commands sent from a handler,
+    or from several threads, each get their own reply, and no wait misses
+    an event that another command read."))
 
 (defun cdp-browser-backend-p (object)
   (typep object 'cdp-browser-backend))
@@ -159,18 +179,84 @@
     (or (null session) (equal session (cdp-session-id backend)))))
 
 (defun %cdp-dispatch (backend message)
-  (let ((params (or (cdp-message-params message) (%ht))))
-    (dolist (handler (reverse (gethash (cdp-message-method message)
-                                       (%cdp-handlers backend))))
+  "Call the ON-CDP-EVENT handlers of MESSAGE (an event), oldest first, on this
+   thread and with no lock held: a handler may send commands and wait."
+  (let ((handlers (bt2:with-lock-held ((%cdp-lock backend))
+                    (reverse (gethash (cdp-message-method message)
+                                      (%cdp-handlers backend)))))
+        (params (or (cdp-message-params message) (%ht))))
+    (dolist (handler handlers)
       (funcall handler params))))
 
-(defun %cdp-note-event (backend message)
-  "Hand MESSAGE (an event) to its handlers, then keep it in the buffer."
-  (%cdp-dispatch backend message)
-  (let* ((events (nconc (%cdp-events backend) (list message)))
-         (excess (- (length events) *cdp-event-buffer-limit*)))
-    (setf (%cdp-events backend)
-          (if (plusp excess) (nthcdr excess events) events))))
+(defun %cdp-file (backend message)
+  "With BACKEND's lock held: keep MESSAGE for whoever waits for it. An event
+   goes to the end of the buffer (→ T: dispatch it once the lock is free). A
+   reply goes to its command when one waits for that id; else it answers a
+   command given up on and is dropped."
+  (incf (%cdp-generation backend))
+  (cond
+   ((cdp-message-method message)
+    (let* ((events (append (%cdp-events backend) (list message)))
+           (excess (- (length events) *cdp-event-buffer-limit*)))
+      (setf (%cdp-events backend)
+            (if (plusp excess) (nthcdr excess events) events)))
+    t)
+   (t
+    (let ((id (cdp-message-id message))
+          (replies (%cdp-replies backend)))
+      (when (and id (eq :waiting (gethash id replies)))
+        (setf (gethash id replies) message)))
+    nil)))
+
+(defun %cdp-await (backend ready deadline limit what)
+  "Call READY (no lock held) until it returns non-NIL; → that value.
+   Meanwhile read: one message at a time from RECV-FN, filed (%CDP-FILE) and,
+   for an event, dispatched to its handlers. While another thread reads,
+   wait until it files something. BROWSER-TIMEOUT once DEADLINE (LIMIT
+   seconds after the start) passes."
+  (let ((lock (%cdp-lock backend))
+        (me (bt2:current-thread)))
+    (loop
+      (let ((seen (bt2:with-lock-held (lock) (%cdp-generation backend))))
+        (let ((value (funcall ready)))
+          (when value
+            (return value)))
+        (let ((read nil) (claimed nil) (late nil))
+          (bt2:with-lock-held (lock)
+            ;; Something filed since READY looked: look again first.
+            (when (= seen (%cdp-generation backend))
+              (let ((reader (%cdp-reader backend))
+                    (left (%seconds-left deadline)))
+                (cond
+                 ((null reader)
+                  (setf (%cdp-reader backend) me
+                        claimed t
+                        read t))
+                 ;; Our own read is on the stack (a handler of its signal).
+                 ((eq reader me) (setf read t))
+                 ((and left (<= left 0)) (setf late t))
+                 (t (bt2:condition-wait (%cdp-filed backend) lock
+                                        :timeout (and left (float left 1d0))))))))
+          (when late
+            (error 'browser-timeout
+                   :method what :limit limit
+                   :message (format nil "nothing for ~a within ~as" what limit)))
+          (when read
+            (let ((message nil)
+                  (dispatch nil))
+              (unwind-protect
+                  (progn
+                    (%cdp-ensure-io backend)
+                    (setf message (%cdp-receive backend deadline limit what)))
+                (bt2:with-lock-held (lock)
+                  (when claimed
+                    (setf (%cdp-reader backend) nil))
+                  (when message
+                    (setf dispatch (%cdp-file backend message)))
+                  (incf (%cdp-generation backend))
+                  (bt2:condition-broadcast (%cdp-filed backend))))
+              (when dispatch
+                (%cdp-dispatch backend message)))))))))
 
 (defun %cdp-reply-result (message method)
   (let ((err (cdp-message-error message)))
@@ -184,23 +270,35 @@
 
 (defun %cdp-command (backend method params session-id timeout)
   "Send one command (on SESSION-ID, NIL = the connection's own target) and
-   read until the reply with its id. Replies to other ids (commands given
-   up on) are dropped; events are noted."
+   → the result of the reply with its id, whoever reads it (%CDP-AWAIT).
+   Its id is in flight until it returns or gives up; a reply after that is
+   dropped."
   (%cdp-ensure-io backend)
-  (let* ((id (incf (cdp-next-id backend)))
-         (cmd (encode-cdp-command id method params))
-         (limit (or timeout (cdp-timeout backend)))
-         (deadline (%deadline limit)))
+  (let* ((limit (or timeout (cdp-timeout backend)))
+         (deadline (%deadline limit))
+         (lock (%cdp-lock backend))
+         (replies (%cdp-replies backend))
+         (id (bt2:with-lock-held (lock)
+               (let ((id (incf (cdp-next-id backend))))
+                 (setf (gethash id replies) :waiting)
+                 id)))
+         (cmd (encode-cdp-command id method params)))
     (when session-id
       (setf (gethash "sessionId" cmd) session-id))
-    (funcall (cdp-send-fn backend) cmd)
-    (loop
-      (let ((msg (%cdp-receive backend deadline limit method)))
-        (cond
-         ((eql id (cdp-message-id msg))
-          (return (%cdp-reply-result msg method)))
-         ((cdp-message-method msg)
-          (%cdp-note-event backend msg)))))))
+    (unwind-protect
+        (progn
+          (bt2:with-lock-held ((%cdp-send-lock backend))
+            (funcall (cdp-send-fn backend) cmd))
+          (%cdp-reply-result
+           (%cdp-await backend
+                       (lambda ()
+                         (bt2:with-lock-held (lock)
+                           (let ((reply (gethash id replies)))
+                             (and (not (eq reply :waiting)) reply))))
+                       deadline limit method)
+           method))
+      (bt2:with-lock-held (lock)
+        (remhash id replies)))))
 
 (defun %cdp-browser-call (backend method &optional params timeout)
   "CDP-CALL on the browser target: no sessionId."
@@ -209,17 +307,22 @@
 (defun on-cdp-event (backend method handler)
   "Call HANDLER with the params (hash-table) of every METHOD event BACKEND
    reads. Events are read while a command waits for its reply or
-   WAIT-FOR-CDP-EVENT waits, on that thread. → HANDLER."
+   WAIT-FOR-CDP-EVENT waits; HANDLER runs on the thread that read the event,
+   with no lock held, so it may send commands (CDP-CALL) itself: their
+   replies, and events they read, still reach the commands and waits they
+   belong to. An error from HANDLER propagates from that call. → HANDLER."
   (check-type method string)
-  (push handler (gethash method (%cdp-handlers backend)))
+  (bt2:with-lock-held ((%cdp-lock backend))
+    (push handler (gethash method (%cdp-handlers backend))))
   handler)
 
 (defun off-cdp-event (backend method &optional handler)
   "Remove HANDLER (every handler when NIL) for METHOD events."
-  (if handler
-      (setf (gethash method (%cdp-handlers backend))
-            (remove handler (gethash method (%cdp-handlers backend))))
-      (remhash method (%cdp-handlers backend)))
+  (bt2:with-lock-held ((%cdp-lock backend))
+    (if handler
+        (setf (gethash method (%cdp-handlers backend))
+              (remove handler (gethash method (%cdp-handlers backend))))
+        (remhash method (%cdp-handlers backend))))
   nil)
 
 (defun %event-matches-p (backend message method test)
@@ -230,33 +333,41 @@
 
 (defun %cdp-forget-events (backend method)
   "Drop buffered METHOD events of BACKEND's session (stale for a new wait)."
-  (setf (%cdp-events backend)
-        (remove-if (lambda (m) (%event-matches-p backend m method nil))
-                   (%cdp-events backend))))
+  (bt2:with-lock-held ((%cdp-lock backend))
+    (setf (%cdp-events backend)
+          (remove-if (lambda (m) (%event-matches-p backend m method nil))
+                     (%cdp-events backend)))))
+
+(defun %cdp-take-event (backend method test)
+  "Remove the oldest buffered METHOD event of BACKEND's session for which
+   TEST (if given) is true of the params; → its params, or NIL when there is
+   none. TEST runs with no lock held."
+  (let ((lock (%cdp-lock backend)))
+    (loop
+      (let* ((events (bt2:with-lock-held (lock) (%cdp-events backend)))
+             (found (find-if (lambda (m) (%event-matches-p backend m method test))
+                             events)))
+        (unless found
+          (return nil))
+        ;; Another waiter may have taken it meanwhile: then look again.
+        (when (bt2:with-lock-held (lock)
+                (when (member found (%cdp-events backend) :test #'eq)
+                  (setf (%cdp-events backend)
+                        (remove found (%cdp-events backend) :test #'eq :count 1))
+                  t))
+          (return (or (cdp-message-params found) (%ht))))))))
 
 (defun wait-for-cdp-event (backend method &key test timeout)
   "→ the params of the first METHOD event of BACKEND's session for which
-   TEST (if given) is true of the params. Takes it from the event buffer,
-   else reads the transport. BROWSER-TIMEOUT after TIMEOUT seconds (default
-   (CDP-TIMEOUT BACKEND))."
+   TEST (if given) is true of the params, taken from the event buffer. Reads
+   the transport until one is there (events other commands read count too).
+   BROWSER-TIMEOUT after TIMEOUT seconds (default (CDP-TIMEOUT BACKEND))."
   (check-type method string)
-  (let ((buffered (find-if (lambda (m) (%event-matches-p backend m method test))
-                           (%cdp-events backend))))
-    (when buffered
-      (setf (%cdp-events backend) (remove buffered (%cdp-events backend) :count 1))
-      (return-from wait-for-cdp-event
-        (or (cdp-message-params buffered) (%ht)))))
-  (%cdp-ensure-io backend)
   (let* ((limit (or timeout (cdp-timeout backend)))
          (deadline (%deadline limit)))
-    (loop
-      (let ((msg (%cdp-receive backend deadline limit method)))
-        (when (cdp-message-method msg)
-          (cond
-           ((%event-matches-p backend msg method test)
-            (%cdp-dispatch backend msg)
-            (return (or (cdp-message-params msg) (%ht))))
-           (t (%cdp-note-event backend msg))))))))
+    (%cdp-await backend
+                (lambda () (%cdp-take-event backend method test))
+                deadline limit method)))
 
 (defun cdp-call (backend method &optional params)
   "Send METHOD with PARAMS (hash-table, plist or alist) on BACKEND's session.
@@ -266,12 +377,58 @@
    BROWSER-TIMEOUT."
   (%cdp-command backend method params (cdp-session-id backend) nil))
 
-(defun %eval-result (result)
-  (or (%jget result "result") result))
+(defun %unserializable-value (text)
+  "A RemoteObject's unserializableValue: a BigInt (\"12n\") → the integer,
+   \"-0\" → -0.0d0, NaN / Infinity / -Infinity → :NAN / :INFINITY /
+   :-INFINITY. Anything else stays the string."
+  (let ((n (length text)))
+    (cond
+     ((equal text "NaN") :nan)
+     ((equal text "Infinity") :infinity)
+     ((equal text "-Infinity") :-infinity)
+     ((equal text "-0") -0.0d0)
+     ((and (> n 1) (char= #\n (char text (1- n))))
+      (multiple-value-bind (value end) (parse-integer text :end (1- n) :junk-allowed t)
+        (if (and value (= end (1- n))) value text)))
+     (t text))))
 
-(defun %value-of (result)
-  (let ((inner (%eval-result result)))
-    (or (%jget inner "value") inner)))
+(defun %remote-object-value (object)
+  "The Lisp value of the CDP RemoteObject OBJECT (Runtime.evaluate with
+   returnByValue): its \"value\" as json-protocol decodes it (false is NIL,
+   null :NULL, an array a vector, an object a hash-table), NIL for
+   undefined, and %UNSERIALIZABLE-VALUE of an unserializableValue. OBJECT
+   itself when it carries no value (a function, say)."
+  (if (not (hash-table-p object))
+      object
+      (multiple-value-bind (value present) (gethash "value" object)
+        (cond
+         (present value)
+         ((equal "undefined" (gethash "type" object)) nil)
+         ((stringp (gethash "unserializableValue" object))
+          (%unserializable-value (gethash "unserializableValue" object)))
+         (t object)))))
+
+(defun %exception-text (details)
+  "One line for Runtime.evaluate's exceptionDetails."
+  (let ((exception (%jget details "exception")))
+    (or (and exception (%jget exception "description"))
+        (and exception (let ((v (%jget exception "value")))
+                         (and v (not (hash-table-p v)) (princ-to-string v))))
+        (%jget details "text")
+        "exception")))
+
+(defun %evaluate (backend expression)
+  "Runtime.evaluate EXPRESSION (returnByValue) on BACKEND's page. → the
+   value (%REMOTE-OBJECT-VALUE). A JavaScript exception signals
+   BROWSER-ERROR with its text (Playwright's evaluate raises too)."
+  (let* ((reply (cdp-call backend "Runtime.evaluate"
+                          (%ht "expression" expression "returnByValue" t)))
+         (details (%jget reply "exceptionDetails")))
+    (when details
+      (error 'browser-error
+             :method "Runtime.evaluate"
+             :message (format nil "JavaScript exception: ~a" (%exception-text details))))
+    (%remote-object-value (%jget reply "result"))))
 
 (defun %js-click (selector)
   (format nil "(function(){var e=document.querySelector(~a); if(!e) throw 'no element'; e.click(); return true;})()"
@@ -331,10 +488,7 @@
       url)))
 
 (defmethod dom-snapshot ((backend cdp-browser-backend))
-  (%value-of
-   (cdp-call backend "Runtime.evaluate"
-             (%ht "expression" "document.documentElement.outerHTML"
-                  "returnByValue" t))))
+  (%evaluate backend "document.documentElement.outerHTML"))
 
 (defmethod screenshot ((backend cdp-browser-backend) &key)
   (let ((result (cdp-call backend "Page.captureScreenshot" (%ht))))
@@ -342,37 +496,32 @@
 
 (defmethod click ((backend cdp-browser-backend) &key selector x y)
   (cond
-    (selector
-     (cdp-call backend "Runtime.evaluate"
-               (%ht "expression" (%js-click selector) "returnByValue" t)))
-    ((and x y)
-     (cdp-call backend "Input.dispatchMouseEvent"
-               (%ht "type" "mousePressed" "x" x "y" y "button" "left" "clickCount" 1))
-     (cdp-call backend "Input.dispatchMouseEvent"
-               (%ht "type" "mouseReleased" "x" x "y" y "button" "left" "clickCount" 1)))
-    (t (error 'browser-error :message "click needs :selector or :x/:y")))
+   ;; A missing element throws in the page: BROWSER-ERROR (%EVALUATE).
+   (selector (%evaluate backend (%js-click selector)))
+   ((and x y)
+    (cdp-call backend "Input.dispatchMouseEvent"
+              (%ht "type" "mousePressed" "x" x "y" y "button" "left" "clickCount" 1))
+    (cdp-call backend "Input.dispatchMouseEvent"
+              (%ht "type" "mouseReleased" "x" x "y" y "button" "left" "clickCount" 1)))
+   (t (error 'browser-error :message "click needs :selector or :x/:y")))
   t)
 
 (defmethod type-text ((backend cdp-browser-backend) text &key selector x y)
   (when (or selector (and x y))
     (click backend :selector selector :x x :y y))
   (if selector
-      (cdp-call backend "Runtime.evaluate"
-                (%ht "expression" (%js-type selector text) "returnByValue" t))
+      (%evaluate backend (%js-type selector text))
       (cdp-call backend "Input.insertText" (%ht "text" text)))
   text)
 
 (defmethod scroll ((backend cdp-browser-backend) &key selector x y dx dy)
   (declare (ignore x y))
-  (cdp-call backend "Runtime.evaluate"
-            (%ht "expression" (%js-scroll selector (or dx 0) (or dy 0))
-                 "returnByValue" t))
+  (%evaluate backend (%js-scroll selector (or dx 0) (or dy 0)))
   t)
 
 (defmethod eval-js ((backend cdp-browser-backend) expression)
-  (%value-of
-   (cdp-call backend "Runtime.evaluate"
-             (%ht "expression" expression "returnByValue" t))))
+  ;; false → NIL, undefined → NIL, null → :NULL; a JS exception signals.
+  (%evaluate backend expression))
 
 (defmethod print-pdf ((backend cdp-browser-backend) &key)
   (let ((result (cdp-call backend "Page.printToPDF" (%ht))))

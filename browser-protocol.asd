@@ -4,7 +4,10 @@
   :author "egao1980"
   :license "MIT"
   ;; CDP JSON and screenshot / PDF base64 go through the stack protocols (#1).
-  :depends-on ("llm-protocol" "json-protocol" "json-backend-jzon" "encoding-protocol")
+  ;; bt2 (the stack's concurrency default): replies and events reach their
+  ;; waiters across threads and handler re-entry (#2).
+  :depends-on ("llm-protocol" "json-protocol" "json-backend-jzon" "encoding-protocol"
+               "bordeaux-threads")
   :properties (:cl-repo
                (:ci (:with ("browser-protocol/capability" "browser-protocol/launch"))))
   :serial t
@@ -46,6 +49,7 @@
                "llm-protocol"
                "json-protocol"
                "process-protocol"
+               "bordeaux-threads"
                "rove")
   :pathname "tests"
   :serial t
@@ -62,7 +66,9 @@
                ;; Defender edge cases: ids, events, navigate wait, JSON errors.
                (:file "cdp-events-test")
                (:file "cdp-reentrancy-test")
-               (:file "stack-json-false-test"))
+               (:file "stack-json-false-test")
+               ;; Defender round 2: threads, handler re-entry, RemoteObject values.
+               (:file "cdp-concurrency-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
