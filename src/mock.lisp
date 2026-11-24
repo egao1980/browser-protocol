@@ -68,7 +68,8 @@
     ((mock-browser-timeout-p backend)
      (error 'browser-timeout :url url :message "mock browser timeout"))))
 
-(defmethod navigate ((backend mock-browser-backend) url)
+(defmethod navigate ((backend mock-browser-backend) url &key wait-until timeout)
+  (declare (ignore wait-until timeout))
   (%maybe-fail backend url)
   (setf (mock-browser-url backend) url)
   url)

@@ -59,11 +59,17 @@
      (lambda () (nreverse sent)))))
 
 (deftest cdp-backend-navigate-builds-command
+  ;; 0.2.0 (#2): Page.enable first (once), so the load event can be awaited.
+  ;; The loopback reply has no loaderId, so there is nothing to wait for.
   (multiple-value-bind (send recv sent-fn) (%loopback-cdp)
     (let ((b (browser-protocol:make-cdp-browser-backend
               :send-fn send :recv-fn recv)))
       (browser-protocol:navigate b "https://ex.test/cdp")
-      (let ((cmd (first (funcall sent-fn))))
+      (browser-protocol:navigate b "https://ex.test/again")
+      (let* ((sent (funcall sent-fn))   ; SENT-FN is destructive: call it once
+             (methods (mapcar #'browser-protocol:cdp-message-method sent))
+             (cmd (second sent)))
+        (ok (equal '("Page.enable" "Page.navigate" "Page.navigate") methods))
         (ok (equal "Page.navigate" (browser-protocol:cdp-message-method cmd)))
         (ok (equal "https://ex.test/cdp"
                    (browser-protocol:cdp-message-param cmd "url")))))))

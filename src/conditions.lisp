@@ -3,7 +3,9 @@
 (define-condition browser-error (error)
   ((message :initarg :message :reader browser-error-message :initform nil)
    (url :initarg :url :reader browser-error-url :initform nil)
-   (method :initarg :method :reader browser-error-method :initform nil))
+   (method :initarg :method :reader browser-error-method :initform nil)
+   (cause :initarg :cause :reader browser-error-cause :initform nil
+          :documentation "The wrapped condition (JSON, websocket, process), if any."))
   (:report (lambda (c s)
              (format s "browser error~@[ (~a)~]~@[: ~a~]"
                      (browser-error-method c)

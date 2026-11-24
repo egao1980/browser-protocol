@@ -18,8 +18,11 @@
 (defvar *browser-backend* nil
   "Current BROWSER-BACKEND, or NIL.")
 
-(defun %ensure-backend (&optional (backend *browser-backend*))
+(defun %ensure-backend (&optional backend)
+  "BACKEND, else *BROWSER-BACKEND* (the NIL-backend methods pass NIL), else
+   BROWSER-ERROR with a USE-VALUE restart."
   (or backend
+      *browser-backend*
       (restart-case
           (error 'browser-error
                  :message "*browser-backend* is nil — bind a backend")
@@ -43,8 +46,13 @@
 (defun make-browser-target (&key id (type "page") url title)
   (make-instance 'browser-target :id id :type type :url url :title title))
 
-(defgeneric navigate (backend url)
-  (:documentation "Navigate BACKEND to URL."))
+(defgeneric navigate (backend url &key wait-until timeout)
+  (:documentation "Navigate BACKEND to URL. → URL.
+   WAIT-UNTIL (Playwright's wait_until): :load (default) returns once the
+   new document's load event fired, :domcontentloaded at DOMContentLoaded,
+   :commit (or NIL) as soon as the navigation is committed. TIMEOUT is in
+   seconds (default: the backend's). A failed navigation (DNS, refused)
+   signals BROWSER-ERROR with the URL."))
 
 (defgeneric dom-snapshot (backend)
   (:documentation "Current DOM as a string or node plist."))
@@ -84,7 +92,7 @@
        ,@(when ignored `((declare (ignore ,@ignored))))
        (call-with-browser-restarts (lambda () (call-next-method))))))
 
-(%define-browser-around navigate (url))
+(%define-browser-around navigate (url &key wait-until timeout))
 (%define-browser-around dom-snapshot ())
 (%define-browser-around screenshot (&key))
 (%define-browser-around click (&key selector x y))
@@ -96,8 +104,8 @@
 (%define-browser-around close-browser ())
 (%define-browser-around list-targets ())
 
-(defmethod navigate ((backend null) url)
-  (navigate (%ensure-backend backend) url))
+(defmethod navigate ((backend null) url &key (wait-until :load) timeout)
+  (navigate (%ensure-backend backend) url :wait-until wait-until :timeout timeout))
 
 (defmethod dom-snapshot ((backend null))
   (dom-snapshot (%ensure-backend backend)))
@@ -192,14 +200,16 @@
          (setf (gethash (%keyword-name (car pair)) h) (cdr pair)))))
     (t params)))
 
-(defun %find-symbol (package name)
-  (let ((pkg (find-package package)))
-    (and pkg (find-symbol name pkg))))
+(defun %encode-json-string (value)
+  "Lisp value → compact JSON text through json-protocol."
+  (json-protocol:encode value))
 
 (defun %decode-json-string (source)
-  (let* ((decode (%find-symbol :json-protocol "DECODE"))
-         (backend (%find-symbol :json-protocol "*JSON-BACKEND*")))
-    (if (and decode (fboundp decode) backend (boundp backend)
-             (symbol-value backend))
-        (funcall decode source)
-        (%parse-json source))))
+  "JSON text → Lisp value through json-protocol (objects are string-key
+   hash-tables, false is NIL, null is :NULL). Malformed text signals
+   BROWSER-ERROR with the json-protocol condition as its cause."
+  (handler-case (json-protocol:decode source)
+    (json-protocol:json-error (c)
+      (error 'browser-error
+             :message (format nil "malformed JSON from the browser: ~a" c)
+             :cause c))))
