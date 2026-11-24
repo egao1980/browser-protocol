@@ -90,6 +90,17 @@
    (handlers :initform (make-hash-table :test 'equal) :accessor %cdp-handlers
              :documentation "Event method → list of ON-CDP-EVENT handlers.")
    (page-enabled-p :initform nil :accessor %cdp-page-enabled-p)
+   (documents :initform '() :accessor %cdp-documents
+              :documentation "The main frame's documents, newest first (at
+               most *CDP-DOCUMENT-HISTORY*): (loaderId . lifecycle names it
+               fired), in the order their events were read.")
+   (documents-seen-p :initform nil :accessor %cdp-documents-seen-p
+                     :documentation "T once a main-frame Page.frameNavigated
+                      with a loaderId was read.")
+   (load-count :initform 0 :accessor %cdp-load-count
+               :documentation "Page.loadEventFired events read.")
+   (dcl-count :initform 0 :accessor %cdp-dcl-count
+              :documentation "Page.domContentEventFired events read.")
    (replies :initform (make-hash-table) :reader %cdp-replies
             :documentation "Id → :WAITING, or its reply, for each command in flight.")
    (reader :initform nil :accessor %cdp-reader
@@ -115,7 +126,8 @@
     waiting for its id, an event to the ON-CDP-EVENT handlers and a bounded
     buffer that WAIT-FOR-CDP-EVENT reads. So commands sent from a handler,
     or from several threads, each get their own reply, and no wait misses
-    an event that another command read."))
+    an event that another command read. Filing also follows the main
+    frame's documents (%CDP-TRACK-DOCUMENT), which NAVIGATE waits on."))
 
 (defun cdp-browser-backend-p (object)
   (typep object 'cdp-browser-backend))
@@ -188,10 +200,53 @@
     (dolist (handler handlers)
       (funcall handler params))))
 
+(defparameter *cdp-document-history* 16
+  "Main-frame documents a backend remembers for NAVIGATE, newest first.")
+
+(defun %cdp-track-document (backend message)
+  "With BACKEND's lock held, MESSAGE an event of BACKEND's session: follow
+   the main frame's documents in the order the browser sent their events.
+   A main-frame Page.frameNavigated (no parentId) starts a document with its
+   loaderId. The Page.domContentEventFired and Page.loadEventFired read after
+   it belong to it, and so does a Page.lifecycleEvent DOMContentLoaded or
+   load with its loaderId. So the load event of the last document, read
+   late, never counts for the next one: Playwright clears a frame's
+   lifecycle events when a new document commits, the same way."
+  (let ((method (cdp-message-method message))
+        (params (cdp-message-params message))
+        (documents (%cdp-documents backend)))
+    (flet ((fired (name &optional loader)
+             (let ((current (first documents)))
+               (when (and current (or (null loader) (equal loader (car current))))
+                 (pushnew name (cdr current) :test #'equal)))))
+      (cond
+       ((equal method "Page.frameNavigated")
+        (let* ((frame (and params (%jget params "frame")))
+               (loader (and frame (%jget frame "loaderId"))))
+          (when (and (stringp loader)
+                     (null (%jget frame "parentId"))
+                     (not (assoc loader documents :test #'equal)))
+            (setf (%cdp-documents-seen-p backend) t
+                  (%cdp-documents backend)
+                  (cons (list loader)
+                        (subseq documents 0 (min (length documents)
+                                                 (1- *cdp-document-history*))))))))
+       ((equal method "Page.domContentEventFired")
+        (incf (%cdp-dcl-count backend))
+        (fired "DOMContentLoaded"))
+       ((equal method "Page.loadEventFired")
+        (incf (%cdp-load-count backend))
+        (fired "load"))
+       ((equal method "Page.lifecycleEvent")
+        (let ((name (and params (%jget params "name"))))
+          (when (member name '("DOMContentLoaded" "load") :test #'equal)
+            (fired name (%jget params "loaderId")))))))))
+
 (defun %cdp-file (backend message)
   "With BACKEND's lock held: keep MESSAGE for whoever waits for it. An event
-   goes to the end of the buffer (→ T: dispatch it once the lock is free). A
-   reply goes to its command when one waits for that id; else it answers a
+   goes to the end of the buffer and to the main frame's documents
+   (%CDP-TRACK-DOCUMENT) (→ T: dispatch it once the lock is free). A reply
+   goes to its command when one waits for that id; else it answers a
    command given up on and is dropped."
   (incf (%cdp-generation backend))
   (cond
@@ -200,6 +255,8 @@
            (excess (- (length events) *cdp-event-buffer-limit*)))
       (setf (%cdp-events backend)
             (if (plusp excess) (nthcdr excess events) events)))
+    (when (%cdp-own-session-p backend message)
+      (%cdp-track-document backend message))
     t)
    (t
     (let ((id (cdp-message-id message))
@@ -331,11 +388,13 @@
        (or (null test)
            (funcall test (or (cdp-message-params message) (%ht))))))
 
-(defun %cdp-forget-events (backend method)
-  "Drop buffered METHOD events of BACKEND's session (stale for a new wait)."
+(defun %cdp-forget-events (backend methods)
+  "Drop the buffered events of BACKEND's session whose method is in METHODS."
   (bt2:with-lock-held ((%cdp-lock backend))
     (setf (%cdp-events backend)
-          (remove-if (lambda (m) (%event-matches-p backend m method nil))
+          (remove-if (lambda (m)
+                       (and (member (cdp-message-method m) methods :test #'equal)
+                            (%cdp-own-session-p backend m)))
                      (%cdp-events backend)))))
 
 (defun %cdp-take-event (backend method test)
@@ -446,9 +505,10 @@
           (or dx 0) (or dy 0)))
 
 (defparameter +navigate-wait-events+
-  '((:load . "Page.loadEventFired")
-    (:domcontentloaded . "Page.domContentEventFired"))
-  "NAVIGATE :wait-until → the Page event that ends the wait.")
+  '((:load "load")
+    (:domcontentloaded "DOMContentLoaded" "load"))
+  "NAVIGATE :wait-until → the lifecycle names of the new document that end
+   the wait (%CDP-TRACK-DOCUMENT).")
 
 (defun %ensure-page-events (backend)
   "Page.enable once per backend: without it Chrome sends no Page events."
@@ -456,8 +516,34 @@
     (cdp-call backend "Page.enable")
     (setf (%cdp-page-enabled-p backend) t)))
 
+(defun %page-event-count (backend names)
+  "Page.domContentEventFired (when NAMES has DOMContentLoaded) plus
+   Page.loadEventFired events BACKEND has read so far."
+  (bt2:with-lock-held ((%cdp-lock backend))
+    (+ (%cdp-load-count backend)
+       (if (member "DOMContentLoaded" names :test #'equal)
+           (%cdp-dcl-count backend)
+           0))))
+
+(defun %navigation-done-p (backend loader names baseline)
+  "True once the main-frame document that navigation LOADER committed, or a
+   later one that replaced it (a redirect from script, say), has fired one
+   of the lifecycle NAMES. Events of earlier documents never count. A peer
+   that never sends a main-frame Page.frameNavigated cannot be followed: for
+   it, a Page event among NAMES read after the Page.navigate reply (more
+   than BASELINE of them, %PAGE-EVENT-COUNT) ends the wait."
+  (let ((documents nil) (seen-p nil))
+    (bt2:with-lock-held ((%cdp-lock backend))
+      (setf documents (copy-tree (%cdp-documents backend))
+            seen-p (%cdp-documents-seen-p backend)))
+    (cond
+     ((assoc loader documents :test #'equal)
+      (intersection names (cdr (first documents)) :test #'equal))
+     (seen-p nil)
+     (t (> (%page-event-count backend names) baseline)))))
+
 (defmethod navigate ((backend cdp-browser-backend) url &key (wait-until :load) timeout)
-  (let* ((event (cond
+  (let* ((names (cond
                  ((member wait-until '(nil :commit)) nil)
                  ((cdr (assoc wait-until +navigate-wait-events+)))
                  (t (error 'browser-error
@@ -465,26 +551,34 @@
                            :message (format nil "wait-until ~s: want :load, :domcontentloaded or :commit"
                                             wait-until)))))
          (limit (or timeout (cdp-timeout backend)))
-         (deadline (%deadline limit)))
-    (when event
+         (deadline (%deadline limit))
+         ;; Read so far, these are an earlier document's, or this one's once
+         ;; the wait is over: a later WAIT-FOR-CDP-EVENT wants the next one.
+         (stale '("Page.domContentEventFired" "Page.loadEventFired")))
+    (when names
       (%ensure-page-events backend)
-      (%cdp-forget-events backend event))
+      (%cdp-forget-events backend stale))
     (let* ((result (%cdp-command backend "Page.navigate" (%ht "url" url)
                                  (cdp-session-id backend) limit))
-           (error-text (%jget result "errorText")))
+           (error-text (%jget result "errorText"))
+           (loader (%jget result "loaderId"))
+           (baseline (%page-event-count backend names)))
       (when (and (stringp error-text) (plusp (length error-text)))
         (error 'browser-error
                :url url :method "Page.navigate"
                :message (format nil "navigation to ~a failed: ~a" url error-text)))
       ;; No loaderId: a same-document navigation (#fragment) fires no load event.
-      (when (and event (%jget result "loaderId") (not (%jget result "isDownload")))
+      (when (and names (stringp loader) (not (%jget result "isDownload")))
         (handler-case
-            (wait-for-cdp-event backend event
-                                :timeout (and deadline (max 0 (%seconds-left deadline))))
+            (%cdp-await backend
+                        (lambda () (%navigation-done-p backend loader names baseline))
+                        deadline limit "Page.navigate")
           (browser-timeout (c)
             (error 'browser-timeout
                    :url url :method "Page.navigate" :limit limit :cause c
-                   :message (format nil "~a: no ~a within ~as" url event limit)))))
+                   :message (format nil "~a: its document fired no ~a within ~as"
+                                    url (first names) limit))))
+        (%cdp-forget-events backend stale))
       url)))
 
 (defmethod dom-snapshot ((backend cdp-browser-backend))
