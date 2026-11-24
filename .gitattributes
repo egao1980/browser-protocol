@@ -1,0 +1,4 @@
+# LF everywhere: on Windows a CRLF checkout turns a format string's line-ending
+# ~ into "~<Return>", an unknown directive (tests/navigate-stale-load-test.lisp).
+* text=auto eol=lf
+*.png binary
