@@ -68,7 +68,9 @@
                (:file "cdp-reentrancy-test")
                (:file "stack-json-false-test")
                ;; Defender round 2: threads, handler re-entry, RemoteObject values.
-               (:file "cdp-concurrency-test"))
+               (:file "cdp-concurrency-test")
+               ;; Prosecution round 2: navigate takes the last page's load event.
+               (:file "navigate-stale-load-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
