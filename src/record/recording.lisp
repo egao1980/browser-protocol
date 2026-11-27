@@ -189,12 +189,6 @@ NIL NIL reason) when the frame cannot be kept."
   (lambda (params)
     (when (equal +audio-binding-name+ (gethash "name" params))
       (%take-from-buffer backend "Runtime.bindingCalled" params)
-      (let* ((p (gethash "payload" params))
-             (cut (and (stringp p) (search ",\"pcm\"" p))))
-        (when cut
-          (format *error-output* "~&BR1DIAG ~a ~a~%"
-                  (get-internal-real-time) (subseq p 0 cut))
-          (finish-output *error-output*)))
       (when (recording-active-p recording)
         (let ((chunk (handler-case (parse-audio-chunk (gethash "payload" params))
                        (browser-protocol:browser-error (c)
