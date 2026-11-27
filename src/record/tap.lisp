@@ -34,17 +34,21 @@
 ;;;;    The tap's track id is the document id (random per document, letters and
 ;;;;    digits), "/", and the context's number in the document (from 1). Its
 ;;;;    seq counts the processor's audioprocess events from 0, sent or not.
-;;;;    Markers: a marker is a ConstantSourceNode on the bus, offset 256 (exact
-;;;;    in float32), started at (M - 0.25) / rate and stopped at (M + 0.75) /
-;;;;    rate, so it plays the one context frame M = Math.round(ctx.currentTime
-;;;;    * rate) + 1536 (the frame when it is put on, and 1536 more). Only the
-;;;;    processor hears it: the bus feeds nothing else and the processor's
-;;;;    output is silent. One is pending at a time: the tap puts one on when
-;;;;    the processor is wired to the destination (when the tap is made, and
-;;;;    by start(), noting then W = Math.round(ctx.currentTime * rate) and the
-;;;;    seq s0 of the next event), and the next one in the event where the
-;;;;    last one is seen, or in the fifth event after it was put on if it is
-;;;;    not seen by then.
+;;;;    Markers: when the processor is wired to the destination (when the tap
+;;;;    is made, and by start()) the tap notes W = Math.round(ctx.currentTime
+;;;;    * rate) and the seq s0 of the next event, and puts one
+;;;;    ConstantSourceNode on the bus (offset 0; stopped and disconnected by
+;;;;    stop()). Its offset is automated with setValueAtTime to draw spikes on
+;;;;    the context's clock: spike j (from 0) is the one frame M_j = M_0 + j *
+;;;;    N, M_0 the multiple of 128 at or below W + 1536 plus 64 (so a spike is
+;;;;    never a quantum's last frame), of value 256 + 8 * (j mod 32) (exact in
+;;;;    float32; the value names j), set at (M_j - 0.25) / rate and back to 0
+;;;;    at (M_j + 0.75) / rate. Spikes are drawn 48 ahead at wiring, then
+;;;;    again 48 past the current one whenever fewer than 24 are left. Only
+;;;;    the processor hears them: the bus feeds nothing else and the
+;;;;    processor's output is silent. One node with an automation timeline,
+;;;;    not a node per marker: making a node per event stalled the page's
+;;;;    main thread for 111 and 354 ms on GitHub's macOS runner.
 ;;;; 4. Each audioprocess event while the tap is active. N is
 ;;;;    +AUDIO-TAP-BUFFER-SIZE+. The frames of its input buffer: Chrome fills
 ;;;;    the processor's two buffers in turn with the frames the graph renders
@@ -52,22 +56,24 @@
 ;;;;    with handlers of up to 100 ms: none is skipped), so the event of seq s
 ;;;;    holds the N frames from
 ;;;;      FRAME = BASE + (s - s0) * N.
-;;;;    BASE is W until a marker is seen. A marker seen at index i of the event
+;;;;    BASE is W until a spike is seen. A spike seen at index i of the event
 ;;;;    of seq s (the first sample of channel 0 that is >= 128, from the first
-;;;;    sample not refilled, below) gives M - i - (s - s0) * N, which becomes
-;;;;    BASE when it lies in BASE - 128 .. BASE + N / 2 (a larger one once the
-;;;;    next marker gives the same within 128 frames) or, for the first one
-;;;;    seen since wiring, when it is at most M and at least W - 128 (W - N
-;;;;    after a restart: Chrome resumes filling the buffer it was filling at
-;;;;    stop(), so the first buffer after start() begins with older frames and
-;;;;    the marker may come one event later; until one is seen, a restarted
-;;;;    tap sends nothing). In that event 256 is taken off the marker's
-;;;;    samples in both channels. Markers keep coming because
-;;;;    Chrome can render a quantum without pulling the graph: the context's
-;;;;    clock moves on 128 frames, the processor's frames do not, and BASE
-;;;;    grows by 128 at the next marker (GitHub's Windows runner: 128 to 256
-;;;;    frames within the first second; a tone scheduled at frame F showed
-;;;;    up 256 frames before F against the marker of the wiring). So FRAME is
+;;;;    sample not refilled, below), of value v, is spike j with j mod 32 =
+;;;;    k = Math.round((v - 256) / 8) and j the nearest such number to (BASE +
+;;;;    (s - s0) * N + i - M_0) / N; it gives M_j - i - (s - s0) * N, which
+;;;;    becomes BASE when it lies in BASE - 128 .. BASE + N / 2 (a larger one
+;;;;    once the next spike gives the same within 128 frames) or, for the
+;;;;    first one seen since wiring, when it is at most M_0 and at least W -
+;;;;    128 (W - N after a restart: Chrome resumes filling the buffer it was
+;;;;    filling at stop(), so the first buffer after start() begins with older
+;;;;    frames; until a spike is seen, a restarted tap sends nothing). Every
+;;;;    sample >= 128 has its spike's value (256 + 8 * its k) taken off in
+;;;;    both channels. Spikes keep coming because Chrome can render a quantum
+;;;;    without pulling the graph: the context's clock moves on 128 frames,
+;;;;    the processor's frames do not, and BASE grows by 128 at the next spike
+;;;;    (GitHub's Windows runner: 128 to 256 frames within the first second;
+;;;;    a tone scheduled at frame F showed up 256 frames before F against a
+;;;;    marker at wiring). So FRAME is
 ;;;;    the context frame of the chunk's first sample as the context's own
 ;;;;    scheduling counts it (a source started at time T is heard from frame
 ;;;;    T * rate); a chunk in which the graph missed a quantum is off by 128
@@ -79,8 +85,8 @@
 ;;;;    0 .. +640 frames late from one event to the next, which moved the
 ;;;;    pitch).
 ;;;;    It does tell how late the event is: LATE = Math.round(playbackTime *
-;;;;    rate) - 2 * N - FRAME (with BASE before this event's marker for the
-;;;;    marker search, after it for the samples sent). From frame FRAME + 2N on
+;;;;    rate) - 2 * N - FRAME (with BASE before this event's spike for the
+;;;;    spike search, after it for the samples sent). From frame FRAME + 2N on
 ;;;;    Chrome refills this buffer with newer frames, so the first LATE + 2 *
 ;;;;    128 - N samples (a render quantum in progress, and one while they are
 ;;;;    read) may be newer: they count as silent, and so do the samples of
@@ -127,6 +133,7 @@
    "  var Q = 128;"
    "  var LEAD = 1536;"
    "  var MARK = 256;"
+   "  var STEP = 8;"
    "  var taps = [];"
    "  var active = true;"
    "  var connect0 = null;"
@@ -148,24 +155,19 @@
    "    }"
    "    return false;"
    "  }"
-   "  function mark(t) {"
-   "    var ctx = t.ctx;"
-   "    var rate = ctx.sampleRate;"
-   "    t.marker = Math.round(ctx.currentTime * rate) + LEAD;"
-   "    t.marking = false;"
-   "    t.waited = 0;"
-   "    try {"
-   "      var source = ctx.createConstantSource();"
-   "      source.offset.value = MARK;"
-   "      connect0.call(source, t.bus);"
-   "      source.start((t.marker - 0.25) / rate);"
-   "      source.stop((t.marker + 0.75) / rate);"
-   "      t.marking = true;"
-   "    } catch (x) {}"
+   "  function spike(t, upTo) {"
+   "    var rate = t.ctx.sampleRate;"
+   "    var offset = t.marks.offset;"
+   "    for (; t.next < upTo; t.next++) {"
+   "      var m = t.marker + t.next * N;"
+   "      offset.setValueAtTime(MARK + STEP * (t.next % 32), (m - 0.25) / rate);"
+   "      offset.setValueAtTime(0, (m + 0.75) / rate);"
+   "    }"
    "  }"
    "  function wire(t) {"
    "    if (!t.wired) {"
-   "      var w = Math.round(t.ctx.currentTime * t.ctx.sampleRate);"
+   "      var ctx = t.ctx;"
+   "      var w = Math.round(ctx.currentTime * ctx.sampleRate);"
    "      t.wiredAt = w;"
    "      t.base = w;"
    "      t.seq0 = t.seq;"
@@ -173,13 +175,30 @@
    "      t.leap = null;"
    "      t.restarted = t.wirings > 0;"
    "      t.wirings = t.wirings + 1;"
-   "      mark(t);"
-   "      connect0.call(t.proc, t.ctx.destination);"
+   "      t.marker = Math.floor((w + LEAD) / Q) * Q + Q / 2;"
+   "      t.next = 0;"
+   "      t.marks = null;"
+   "      try {"
+   "        var source = ctx.createConstantSource();"
+   "        source.offset.value = 0;"
+   "        connect0.call(source, t.bus);"
+   "        source.start();"
+   "        t.marks = source;"
+   "        spike(t, 48);"
+   "      } catch (x) {}"
+   "      connect0.call(t.proc, ctx.destination);"
    "      t.wired = true;"
    "    }"
    "  }"
    "  function unwire(t) {"
-   "    if (t.wired) { t.wired = false; disconnect0.call(t.proc); }"
+   "    if (t.wired) {"
+   "      t.wired = false;"
+   "      disconnect0.call(t.proc);"
+   "      if (t.marks) {"
+   "        try { t.marks.stop(); disconnect0.call(t.marks); } catch (x) {}"
+   "        t.marks = null;"
+   "      }"
+   "    }"
    "  }"
    "  function code(x) {"
    "    var c = Math.round(x * 32768);"
@@ -202,10 +221,12 @@
    "    var dispatched = Math.round(e.playbackTime * rate) - 2 * N;"
    "    var fresh = Math.max(0, dispatched - (t.base + cycle * N) + 2 * Q - N);"
    "    var at = -1;"
-   "    if (t.marking) {"
+   "    if (t.marks) {"
    "      for (var i = fresh; i < n; i++) { if (left[i] >= MARK / 2) { at = i; break; } }"
    "      if (at >= 0) {"
-   "        var base = t.marker - at - cycle * N;"
+   "        var k = Math.round((left[at] - MARK) / STEP);"
+   "        var guess = (t.base + cycle * N + at - t.marker) / N;"
+   "        var base = t.marker + (k + 32 * Math.round((guess - k) / 32)) * N - at - cycle * N;"
    "        var ok = false;"
    "        if (!t.anchored) {"
    "          ok = base <= t.marker && base >= t.wiredAt - (t.restarted ? N : Q);"
@@ -216,11 +237,9 @@
    "          t.leap = ok ? null : base;"
    "        }"
    "        if (ok) { t.base = base; t.anchored = true; t.leap = null; }"
-   "        mark(t);"
-   "      } else {"
-   "        t.waited = t.waited + 1;"
-   "        if (t.waited > 4) { mark(t); }"
    "      }"
+   "      var near = Math.round((ctx.currentTime * rate - t.marker) / N);"
+   "      if (t.next < near + 24) { try { spike(t, near + 48); } catch (x) {} }"
    "    }"
    "    if (t.restarted && !t.anchored) { return; }"
    "    var frame = t.base + cycle * N;"
@@ -232,7 +251,7 @@
    "    for (var p = from; p < n; p++) {"
    "      var x = left[p];"
    "      var y = right[p];"
-   "      if (at >= 0 && x >= MARK / 2) { x -= MARK; y -= MARK; }"
+   "      if (t.marks && x >= MARK / 2) { var s = MARK + STEP * Math.round((x - MARK) / STEP); x -= s; y -= s; }"
    "      var a = code(x);"
    "      var b = code(y);"
    "      if (a !== 0 || b !== 0) { heard = true; }"
@@ -271,7 +290,7 @@
    "    var t = {ctx: ctx, bus: bus, proc: proc, seq: 0, wired: false,"
    "             track: doc + '/' + (taps.length + 1),"
    "             base: 0, seq0: 0, wiredAt: 0, anchored: false, marker: 0,"
-   "             marking: false, waited: 0, leap: null, wirings: 0, restarted: false};"
+   "             marks: null, next: 0, leap: null, wirings: 0, restarted: false};"
    "    taps.push(t);"
    "    proc.onaudioprocess = function (e) { try { send(t, e); } catch (x) {} };"
    "    connect0.call(bus, proc);"
