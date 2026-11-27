@@ -3,7 +3,11 @@
 ;;; Live tests. Each skips, saying why, without what it needs:
 ;;;   Chrome   headless Chrome / Chromium / Edge (FIND-BROWSER-EXECUTABLE,
 ;;;            CHROME_PATH) whose AudioContext runs;
-;;;   ffmpeg   ffmpeg and ffprobe (FFMPEG_PATH, PATH, the usual install paths).
+;;;   ffmpeg   ffmpeg and ffprobe (FFMPEG_PATH, PATH, the usual install paths);
+;;;   audio    for the tests that play a tone and check the captured page
+;;;            audio: an audio output device, as the OS reports it
+;;;            (%AUDIO-OUTPUT-DEVICE-P; BROWSER_PROTOCOL_AUDIO_TESTS=1 or 0
+;;;            overrides it).
 ;;; The page is tests/record/fixtures/tone.html, opened as a file: URL. Its
 ;;; Content-Security-Policy (a meta element, which file: pages keep) is
 ;;; default-src 'self'; script-src 'self'; style-src 'self'; worker-src 'none':
@@ -99,6 +103,120 @@
         "-i" (format nil "color=~a:s=~dx~d" color width height)
         "-frames:v" "1" "-update" "1" (uiop:native-namestring path))
   path)
+
+;;; --- an audio output device -------------------------------------------------
+;;; No audio, no audio tests: the live tests that play a tone through the page
+;;; and check the captured audio run only where the OS reports an audio output
+;;; device. Without one Chrome plays into a fake output whose timing stalls
+;;; (the GitHub runners: browser-protocol#15, #16), so there is no page audio
+;;; to check. BROWSER_PROTOCOL_AUDIO_TESTS overrides the detection: 1 runs
+;;; these tests, 0 skips them.
+
+(defparameter +audio-tests-variable+ "BROWSER_PROTOCOL_AUDIO_TESTS")
+
+(defun %macos-audio-outputs ()
+  "macOS: system_profiler's audio devices. -> (values output-p description);
+   an output device has output channels or is the default output."
+  (let* ((json (json-protocol:decode (%run "system_profiler" "SPAudioDataType" "-json")))
+         (items (loop for group across (or (gethash "SPAudioDataType" json) #())
+                      append (coerce (or (gethash "_items" group) #()) 'list)))
+         (outputs (remove-if-not
+                   (lambda (item)
+                     (or (let ((n (gethash "coreaudio_device_output" item)))
+                           (and (integerp n) (plusp n)))
+                         (equal "spaudio_yes"
+                                (gethash "coreaudio_default_audio_output_device" item))))
+                   items)))
+    (values (and outputs t)
+            (format nil "system_profiler SPAudioDataType: ~d device~:p~:{, ~a (~a output channels~:[~;, default output~])~}"
+                    (length items)
+                    (mapcar (lambda (item)
+                              (list (gethash "_name" item)
+                                    (or (gethash "coreaudio_device_output" item) 0)
+                                    (equal "spaudio_yes"
+                                           (gethash "coreaudio_default_audio_output_device" item))))
+                            items)))))
+
+(defparameter +windows-audio-query+
+  "$ProgressPreference = 'SilentlyContinue'; $render = @(Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render' -ErrorAction SilentlyContinue | Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DeviceState -eq 1 }).Count; $sound = @(Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue).Count; Write-Output ([string]$render + ' ' + [string]$sound)"
+  "PowerShell: the number of active render endpoints (MMDevices DeviceState 1)
+   and of Win32_SoundDevice instances, on one line.")
+
+(defun %powershell-encoded (script)
+  "SCRIPT for powershell -EncodedCommand: base64 of its UTF-16LE (no quoting)."
+  (let ((octets (make-array (* 2 (length script)) :element-type '(unsigned-byte 8))))
+    (loop for ch across script
+          for i from 0 by 2
+          do (setf (aref octets i) (ldb (byte 8 0) (char-code ch))
+                   (aref octets (1+ i)) (ldb (byte 8 8) (char-code ch))))
+    (encoding-protocol:encode octets :encoding :base64)))
+
+(defun %windows-audio-outputs ()
+  "Windows: active render endpoints. -> (values output-p description)."
+  (let* ((out (%run "powershell.exe" "-NoProfile" "-NonInteractive"
+                    "-EncodedCommand" (%powershell-encoded +windows-audio-query+)))
+         (fields (remove "" (uiop:split-string out :separator '(#\Space #\Tab #\Return #\Newline))
+                         :test #'string=))
+         (render (parse-integer (first fields)))
+         (sound (parse-integer (second fields))))
+    (values (plusp render)
+            (format nil "~d active render endpoint~:p (MMDevices), ~d Win32_SoundDevice~:p"
+                    render sound))))
+
+(defun %linux-audio-outputs ()
+  "Linux: /proc/asound/cards. -> (values output-p description)."
+  (let ((cards (probe-file "/proc/asound/cards")))
+    (if (null cards)
+        (values nil "no /proc/asound/cards")
+        (let* ((text (uiop:read-file-string cards))
+               (line (string-trim '(#\Space #\Tab #\Return)
+                                  (or (find-if (lambda (l) (string/= "" (string-trim " " l)))
+                                               (uiop:split-string text :separator '(#\Newline)))
+                                      ""))))
+          (values (and (string/= "" line) (not (search "no soundcards" text)) t)
+                  (format nil "/proc/asound/cards: ~:[~a~;empty~]" (string= "" line) line))))))
+
+(defvar *audio-output* nil
+  "NIL until asked, then (run-p . why): whether the live page-audio tests run here.")
+
+(defun %audio-output-device-p ()
+  "True when this machine has an audio output device, so the live tests that
+   play and capture page audio run; the second value says why. An override
+   in BROWSER_PROTOCOL_AUDIO_TESTS (1 or 0) wins. Asked once; the answer is
+   printed once, so a log shows why those tests ran or skipped."
+  (unless *audio-output*
+    (let ((override (uiop:getenv +audio-tests-variable+)))
+      (setf *audio-output*
+            (cond
+              ((equal override "1") (cons t (format nil "~a=1" +audio-tests-variable+)))
+              ((equal override "0") (cons nil (format nil "~a=0" +audio-tests-variable+)))
+              (t
+               (multiple-value-bind (present description)
+                   (handler-case
+                       (cond ((uiop:os-macosx-p) (%macos-audio-outputs))
+                             ((uiop:os-windows-p) (%windows-audio-outputs))
+                             ((uiop:os-unix-p) (%linux-audio-outputs))
+                             (t (values nil "no detection for this OS")))
+                     (error (e) (values nil (format nil "the OS could not be asked: ~a" e))))
+                 (let ((ignored (and override (string/= "" override)
+                                     (format nil "; ~a=~a is neither 1 nor 0"
+                                             +audio-tests-variable+ override))))
+                   (cons present
+                         (format nil "~:[no audio output device~;an audio output device~] (~a~@[~a~])~:[; ~a=1 runs them~;~]"
+                                 present description ignored present +audio-tests-variable+)))))))
+      (format t "~&;; live page-audio tests ~:[skip~;run~]: ~a~%"
+              (car *audio-output*) (cdr *audio-output*))))
+  (values (car *audio-output*) (cdr *audio-output*)))
+
+(defmacro with-audio-output ((&key covers) &body body)
+  "BODY when %AUDIO-OUTPUT-DEVICE-P; otherwise skip, saying why and, for a
+   test that checks more than the page's audio, what else it COVERS."
+  (let ((run (gensym "RUN")) (why (gensym "WHY")))
+    `(multiple-value-bind (,run ,why) (%audio-output-device-p)
+       (if ,run
+           (progn ,@body)
+           (skip (format nil "page audio not tested: ~a~@[ (this test also checks ~a)~]"
+                         ,why ,covers))))))
 
 ;;; --- signals ----------------------------------------------------------------
 
@@ -217,99 +335,102 @@
         "a blob: worklet module is refused")))
 
 (deftest live-page-audio-is-captured-under-a-strict-csp
-  (with-live-browser (b)
-    (let ((r (rec:start-recording b)))
-      (unwind-protect
-           (progn
-             (bp:navigate b (%fixture-url "tone.html"))
-             (ok (null (bp:eval-js b "window.inlineScriptRan === true")) "the CSP is in force")
-             (%unless-audio-runs (b (%play b 440 1.0 0.5))
-               (sleep 1.4)
-               (rec:stop-recording r)
-               (let* ((tracks (rec:recording-audio-tracks r))
-                      (start (rational (rec:recording-start-time r)))
-                      (mix (rec:mix-recording r))
-                      (onset (%onset mix))
-                      (expected (- heard start)))
-                 (ok (= 1 (length tracks)) "one AudioContext, one track")
-                 (ok (search "/1" (rec:audio-track-id (first tracks))))
-                 (ok (= 48000 (audio:pcm-buffer-sample-rate mix)))
-                 (ok (and onset (< (abs (- onset expected)) +placement-tolerance+))
-                     (format nil "onset ~,4fs, the page heard it at ~,4fs" onset (float expected)))
-                 (ok (< (abs (- (%pitch mix (+ onset 0.1)) 440)) +pitch-tolerance+)
-                     (format nil "pitch ~,2f Hz" (%pitch mix (+ onset 0.1))))
-                 (ok (< (abs (- (- (%offset mix) onset) 1)) 0.01)
-                     (format nil "the tone lasts ~,4fs" (- (%offset mix) onset)))
-                 (ok (rec:recording-frames r) "frames")
-                 (ok (every (lambda (f)
-                              (let ((o (%read-octets (rec:recording-frame-pathname f))))
-                                (and (> (length o) 2) (= #xFF (aref o 0)) (= #xD8 (aref o 1)))))
-                            (rec:recording-frames r))
-                     "every frame file is a JPEG")
-                 (ok (null (rec:recording-warnings r)) "nothing dropped")
-                 (ok (rec:recording-stop-time r)))))
-        (let ((dir (rec:recording-directory r)))
-          (rec:discard-recording r)
-          (ok (not (probe-file dir)) "discarded"))))))
+  (with-audio-output (:covers "its screencast frames and DISCARD-RECORDING")
+    (with-live-browser (b)
+      (let ((r (rec:start-recording b)))
+        (unwind-protect
+             (progn
+               (bp:navigate b (%fixture-url "tone.html"))
+               (ok (null (bp:eval-js b "window.inlineScriptRan === true")) "the CSP is in force")
+               (%unless-audio-runs (b (%play b 440 1.0 0.5))
+                 (sleep 1.4)
+                 (rec:stop-recording r)
+                 (let* ((tracks (rec:recording-audio-tracks r))
+                        (start (rational (rec:recording-start-time r)))
+                        (mix (rec:mix-recording r))
+                        (onset (%onset mix))
+                        (expected (- heard start)))
+                   (ok (= 1 (length tracks)) "one AudioContext, one track")
+                   (ok (search "/1" (rec:audio-track-id (first tracks))))
+                   (ok (= 48000 (audio:pcm-buffer-sample-rate mix)))
+                   (ok (and onset (< (abs (- onset expected)) +placement-tolerance+))
+                       (format nil "onset ~,4fs, the page heard it at ~,4fs" onset (float expected)))
+                   (ok (< (abs (- (%pitch mix (+ onset 0.1)) 440)) +pitch-tolerance+)
+                       (format nil "pitch ~,2f Hz" (%pitch mix (+ onset 0.1))))
+                   (ok (< (abs (- (- (%offset mix) onset) 1)) 0.01)
+                       (format nil "the tone lasts ~,4fs" (- (%offset mix) onset)))
+                   (ok (rec:recording-frames r) "frames")
+                   (ok (every (lambda (f)
+                                (let ((o (%read-octets (rec:recording-frame-pathname f))))
+                                  (and (> (length o) 2) (= #xFF (aref o 0)) (= #xD8 (aref o 1)))))
+                              (rec:recording-frames r))
+                       "every frame file is a JPEG")
+                   (ok (null (rec:recording-warnings r)) "nothing dropped")
+                   (ok (rec:recording-stop-time r)))))
+          (let ((dir (rec:recording-directory r)))
+            (rec:discard-recording r)
+            (ok (not (probe-file dir)) "discarded")))))))
 
 (deftest live-tap-installed-in-the-current-document
   ;; Recording starts after the page loaded: Runtime.evaluate installs the tap.
-  (with-live-browser (b)
-    (bp:navigate b (%fixture-url "tone.html"))
-    (let ((r (rec:start-recording b)))
-      (unwind-protect
-           (%unless-audio-runs (b (%play b 660 0.4 0.3))
-             (sleep 0.8)
-             (rec:stop-recording r)
-             (let* ((mix (rec:mix-recording r))
-                    (onset (%onset mix)))
-               (ok (and onset (< (abs (- onset (- heard (rational (rec:recording-start-time r)))))
-                                 +placement-tolerance+)))
-               (ok (< (abs (- (%pitch mix (+ onset 0.05) :size 4096) 660)) (* 2 +pitch-tolerance+)))))
-        (rec:discard-recording r)))))
+  (with-audio-output ()
+    (with-live-browser (b)
+      (bp:navigate b (%fixture-url "tone.html"))
+      (let ((r (rec:start-recording b)))
+        (unwind-protect
+             (%unless-audio-runs (b (%play b 660 0.4 0.3))
+               (sleep 0.8)
+               (rec:stop-recording r)
+               (let* ((mix (rec:mix-recording r))
+                      (onset (%onset mix)))
+                 (ok (and onset (< (abs (- onset (- heard (rational (rec:recording-start-time r)))))
+                                   +placement-tolerance+)))
+                 (ok (< (abs (- (%pitch mix (+ onset 0.05) :size 4096) 660)) (* 2 +pitch-tolerance+)))))
+          (rec:discard-recording r))))))
 
 (deftest live-navigation-keeps-the-audio-up-to-it
   ;; A tone plays, the page navigates mid-tone (the document and its
   ;; AudioContext go away), the new document plays another tone: two tracks,
   ;; the first kept up to the navigation.
-  (with-live-browser (b)
-    (let ((r (rec:start-recording b)))
-      (unwind-protect
-           (progn
-             (bp:navigate b (%fixture-url "tone.html"))
-             (%unless-audio-runs (b (%play b 440 2.0 0.3))
-               (sleep 0.6)
-               (let ((left (%page-now b)))
-                 (bp:navigate b (%fixture-url "tone.html"))
-                 (let ((state (%play b 880 0.5 0.3))
-                       (second-heard (%heard-epoch b)))
-                   (sleep 0.8)
-                   (rec:stop-recording r)
-                   (ok (equal "running" state))
-                   (let* ((start (rational (rec:recording-start-time r)))
-                          (tracks (rec:recording-audio-tracks r))
-                          (mix (rec:mix-recording r))
-                          (first-onset (%onset mix))
-                          (first-end (%offset mix :gap 0.05)))
-                     (ok (= 2 (length tracks)) "a track per document")
-                     (ok (not (equal (rec:audio-track-id (first tracks))
-                                     (rec:audio-track-id (second tracks)))))
-                     (ok (< (abs (- first-onset (- heard start))) +placement-tolerance+))
-                     (ok (>= first-end (- left start +navigation-loss+))
-                         (format nil "the first tone lasts until ~,3fs; the page left at ~,3fs"
-                                 first-end (float (- left start))))
-                     (ok (< (abs (- (%pitch mix (+ first-onset 0.1)) 440)) +pitch-tolerance+))
-                     (ok second-heard)
-                     (when second-heard
-                       (let ((second-onset (%onset mix :from (+ first-end 0.02))))
-                         (ok (and second-onset
-                                  (< (abs (- second-onset (- second-heard start)))
-                                     +placement-tolerance+))
-                             (format nil "second onset ~a" second-onset))
-                         (when second-onset
-                           (ok (< (abs (- (%pitch mix (+ second-onset 0.05)) 880))
-                                  +pitch-tolerance+))))))))))
-        (rec:discard-recording r)))))
+  (with-audio-output ()
+    (with-live-browser (b)
+      (let ((r (rec:start-recording b)))
+        (unwind-protect
+             (progn
+               (bp:navigate b (%fixture-url "tone.html"))
+               (%unless-audio-runs (b (%play b 440 2.0 0.3))
+                 (sleep 0.6)
+                 (let ((left (%page-now b)))
+                   (bp:navigate b (%fixture-url "tone.html"))
+                   (let ((state (%play b 880 0.5 0.3))
+                         (second-heard (%heard-epoch b)))
+                     (sleep 0.8)
+                     (rec:stop-recording r)
+                     (ok (equal "running" state))
+                     (let* ((start (rational (rec:recording-start-time r)))
+                            (tracks (rec:recording-audio-tracks r))
+                            (mix (rec:mix-recording r))
+                            (first-onset (%onset mix))
+                            (first-end (%offset mix :gap 0.05)))
+                       (ok (= 2 (length tracks)) "a track per document")
+                       (ok (not (equal (rec:audio-track-id (first tracks))
+                                       (rec:audio-track-id (second tracks)))))
+                       (ok (< (abs (- first-onset (- heard start))) +placement-tolerance+))
+                       (ok (>= first-end (- left start +navigation-loss+))
+                           (format nil "the first tone lasts until ~,3fs; the page left at ~,3fs"
+                                   first-end (float (- left start))))
+                       (ok (< (abs (- (%pitch mix (+ first-onset 0.1)) 440)) +pitch-tolerance+))
+                       (ok second-heard)
+                       (when second-heard
+                         (let ((second-onset (%onset mix :from (+ first-end 0.02))))
+                           (ok (and second-onset
+                                    (< (abs (- second-onset (- second-heard start)))
+                                       +placement-tolerance+))
+                               (format nil "second onset ~a" second-onset))
+                           (when second-onset
+                             (ok (< (abs (- (%pitch mix (+ second-onset 0.05)) 880))
+                                    +pitch-tolerance+))))))))))
+          (rec:discard-recording r))))))
 
 ;;; --- ffmpeg: saved frames to MP4 --------------------------------------------
 
@@ -422,58 +543,59 @@
 ;;; --- Chrome and ffmpeg: a page with sound to MP4 ----------------------------
 
 (deftest live-recording-with-sound-to-mp4
-  (if (not (and (%ffmpeg-path) (%ffprobe-path)))
-      (skip "no ffmpeg / ffprobe (set FFMPEG_PATH)")
-      (with-live-browser (b)
-        (let ((dir (%scratch-directory "page"))
-              (rec:*ffmpeg-program* (%ffmpeg-path))
-              (saved nil))
-          (unwind-protect
-               (rec:with-recording (r b)
-                 (setf saved r)
-                 (bp:navigate b (%fixture-url "tone.html"))
-                 (%unless-audio-runs (b (%play b 440 1.0 0.5))
-                   (sleep 1.2)
-                   ;; A clip on the page's clock: 1.5 s after the tone was heard.
-                   (let ((beep (merge-pathnames "beep.wav" dir)))
-                     (audio:write-wav (%sine 48000 0.2 1000) beep)
-                     (rec:add-audio-file r beep :epoch (+ heard 3/2)))
-                   (sleep 1.0)
-                   (rec:stop-recording r)
-                   (let* ((out (merge-pathnames "page.mp4" dir))
-                          (start (rational (rec:recording-start-time r)))
-                          (tone-at (- heard start)))
-                     (rec:write-video r out)
-                     (let* ((streams (%streams out))
-                            (video (%stream streams "video")))
-                       (ok video "a video stream")
-                       (ok (equal "h264" (gethash "codec_name" video)))
-                       (ok (equal "yuv420p" (gethash "pix_fmt" video)))
-                       (ok (evenp (gethash "width" video)))
-                       (ok (evenp (gethash "height" video)))
-                       (ok (equal "aac" (gethash "codec_name" (%stream streams "audio"))) "an AAC stream")
-                       (ok (< (abs (- (* (parse-integer (gethash "nb_read_frames" video)) 1/30)
-                                      (- (rational (rec:recording-stop-time r)) start)))
-                              1/15)
-                           "the video lasts until the recording stopped"))
-                     (let* ((pcm (%decoded-audio out dir))
-                            (onset (%onset pcm))
-                            (beep-at (%onset pcm :from (+ tone-at 1.2))))
-                       (ok (and onset (< (abs (- onset tone-at)) +mp4-onset-tolerance+))
-                           (format nil "tone at ~,4fs, heard at ~,4fs" onset (float tone-at)))
-                       (ok (< (abs (- (%pitch pcm (+ onset 0.1)) 440)) +pitch-tolerance+))
-                       (ok (and beep-at (< (abs (- beep-at (+ tone-at 3/2))) +mp4-onset-tolerance+))
-                           (format nil "beep at ~,4fs" beep-at))
-                       (when beep-at
-                         (ok (< (abs (- (%pitch pcm (+ beep-at 0.05) :size 4096) 1000))
-                                +pitch-tolerance+)))
-                       ;; The page turns white when it hears the tone.
-                       (let* ((levels (%center-levels out))
-                              (white (position-if (lambda (v) (> v 128)) levels)))
-                         (ok white "the page turned white")
-                         (when (and white onset)
-                           (let ((lag (- (/ white 30) onset)))
-                             (ok (<= (- +av-lead-tolerance+) lag +av-lag-tolerance+)
-                                 (format nil "first white frame ~,4fs after the tone" (float lag))))))))))
-            (when saved (rec:discard-recording saved))
-            (%remove-directory dir))))))
+  (with-audio-output (:covers "the MP4's H.264 video and its A/V sync")
+    (if (not (and (%ffmpeg-path) (%ffprobe-path)))
+        (skip "no ffmpeg / ffprobe (set FFMPEG_PATH)")
+        (with-live-browser (b)
+          (let ((dir (%scratch-directory "page"))
+                (rec:*ffmpeg-program* (%ffmpeg-path))
+                (saved nil))
+            (unwind-protect
+                 (rec:with-recording (r b)
+                   (setf saved r)
+                   (bp:navigate b (%fixture-url "tone.html"))
+                   (%unless-audio-runs (b (%play b 440 1.0 0.5))
+                     (sleep 1.2)
+                     ;; A clip on the page's clock: 1.5 s after the tone was heard.
+                     (let ((beep (merge-pathnames "beep.wav" dir)))
+                       (audio:write-wav (%sine 48000 0.2 1000) beep)
+                       (rec:add-audio-file r beep :epoch (+ heard 3/2)))
+                     (sleep 1.0)
+                     (rec:stop-recording r)
+                     (let* ((out (merge-pathnames "page.mp4" dir))
+                            (start (rational (rec:recording-start-time r)))
+                            (tone-at (- heard start)))
+                       (rec:write-video r out)
+                       (let* ((streams (%streams out))
+                              (video (%stream streams "video")))
+                         (ok video "a video stream")
+                         (ok (equal "h264" (gethash "codec_name" video)))
+                         (ok (equal "yuv420p" (gethash "pix_fmt" video)))
+                         (ok (evenp (gethash "width" video)))
+                         (ok (evenp (gethash "height" video)))
+                         (ok (equal "aac" (gethash "codec_name" (%stream streams "audio"))) "an AAC stream")
+                         (ok (< (abs (- (* (parse-integer (gethash "nb_read_frames" video)) 1/30)
+                                        (- (rational (rec:recording-stop-time r)) start)))
+                                1/15)
+                             "the video lasts until the recording stopped"))
+                       (let* ((pcm (%decoded-audio out dir))
+                              (onset (%onset pcm))
+                              (beep-at (%onset pcm :from (+ tone-at 1.2))))
+                         (ok (and onset (< (abs (- onset tone-at)) +mp4-onset-tolerance+))
+                             (format nil "tone at ~,4fs, heard at ~,4fs" onset (float tone-at)))
+                         (ok (< (abs (- (%pitch pcm (+ onset 0.1)) 440)) +pitch-tolerance+))
+                         (ok (and beep-at (< (abs (- beep-at (+ tone-at 3/2))) +mp4-onset-tolerance+))
+                             (format nil "beep at ~,4fs" beep-at))
+                         (when beep-at
+                           (ok (< (abs (- (%pitch pcm (+ beep-at 0.05) :size 4096) 1000))
+                                  +pitch-tolerance+)))
+                         ;; The page turns white when it hears the tone.
+                         (let* ((levels (%center-levels out))
+                                (white (position-if (lambda (v) (> v 128)) levels)))
+                           (ok white "the page turned white")
+                           (when (and white onset)
+                             (let ((lag (- (/ white 30) onset)))
+                               (ok (<= (- +av-lead-tolerance+) lag +av-lag-tolerance+)
+                                   (format nil "first white frame ~,4fs after the tone" (float lag))))))))))
+              (when saved (rec:discard-recording saved))
+              (%remove-directory dir)))))))
