@@ -108,34 +108,50 @@
 ;;; No audio, no audio tests: the live tests that play a tone through the page
 ;;; and check the captured audio run only where the OS reports an audio output
 ;;; device. Without one Chrome plays into a fake output whose timing stalls
-;;; (the GitHub runners: browser-protocol#15, #16), so there is no page audio
-;;; to check. BROWSER_PROTOCOL_AUDIO_TESTS overrides the detection: 1 runs
-;;; these tests, 0 skips them.
+;;; (the GitHub runners: browser-protocol#15, #16; the macOS runner is a VM
+;;; whose only output devices are virtual), so there is no page audio to
+;;; check. BROWSER_PROTOCOL_AUDIO_TESTS overrides the detection: 1 runs these
+;;; tests, 0 skips them.
 
 (defparameter +audio-tests-variable+ "BROWSER_PROTOCOL_AUDIO_TESTS")
 
+(defun %macos-device-transport (item)
+  "A system_profiler audio device's transport: builtin, usb, virtual, ... or unknown."
+  (let ((transport (gethash "coreaudio_device_transport" item))
+        (prefix "coreaudio_device_type_"))
+    (cond ((not (stringp transport)) "unknown")
+          ((and (> (length transport) (length prefix))
+                (string= prefix transport :end2 (length prefix)))
+           (subseq transport (length prefix)))
+          (t transport))))
+
 (defun %macos-audio-outputs ()
-  "macOS: system_profiler's audio devices. -> (values output-p description);
-   an output device has output channels or is the default output."
+  "macOS: system_profiler's audio devices. -> (values output-p description).
+   An output device has output channels or is the default output, and is
+   hardware: a virtual transport (a VM's sound device, a loopback driver such
+   as the Null Audio Device), an aggregate or an unknown one does not count."
   (let* ((json (json-protocol:decode (%run "system_profiler" "SPAudioDataType" "-json")))
          (items (loop for group across (or (gethash "SPAudioDataType" json) #())
                       append (coerce (or (gethash "_items" group) #()) 'list)))
+         (devices (mapcar (lambda (item)
+                            (list (gethash "_name" item)
+                                  (let ((n (gethash "coreaudio_device_output" item)))
+                                    (if (integerp n) n 0))
+                                  (%macos-device-transport item)
+                                  (equal "spaudio_yes"
+                                         (gethash "coreaudio_default_audio_output_device" item))))
+                          items))
          (outputs (remove-if-not
-                   (lambda (item)
-                     (or (let ((n (gethash "coreaudio_device_output" item)))
-                           (and (integerp n) (plusp n)))
-                         (equal "spaudio_yes"
-                                (gethash "coreaudio_default_audio_output_device" item))))
-                   items)))
+                   (lambda (device)
+                     (destructuring-bind (name channels transport default) device
+                       (declare (ignore name))
+                       (and (or (plusp channels) default)
+                            (not (member transport '("virtual" "aggregate" "unknown")
+                                         :test #'string=)))))
+                   devices)))
     (values (and outputs t)
-            (format nil "system_profiler SPAudioDataType: ~d device~:p~:{, ~a (~a output channels~:[~;, default output~])~}"
-                    (length items)
-                    (mapcar (lambda (item)
-                              (list (gethash "_name" item)
-                                    (or (gethash "coreaudio_device_output" item) 0)
-                                    (equal "spaudio_yes"
-                                           (gethash "coreaudio_default_audio_output_device" item))))
-                            items)))))
+            (format nil "system_profiler SPAudioDataType: ~d device~:p~:{, ~a (~a output channels, ~a~:[~;, default output~])~}"
+                    (length devices) devices))))
 
 (defparameter +windows-audio-query+
   "$ProgressPreference = 'SilentlyContinue'; $render = @(Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render' -ErrorAction SilentlyContinue | Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DeviceState -eq 1 }).Count; $sound = @(Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue).Count; Write-Output ([string]$render + ' ' + [string]$sound)"
