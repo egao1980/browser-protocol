@@ -162,11 +162,6 @@ NIL NIL reason) when the frame cannot be kept."
 (defun %frame-handler (recording backend)
   "The Page.screencastFrame handler: keep the frame (file header), then ack it."
   (lambda (params)
-    (let ((md (gethash "metadata" params)))
-      (progn
-        (format *error-output* "~&BR1FRAME now ~,4f ts ~a active ~a~%" (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))
-                (and (hash-table-p md) (gethash "timestamp" md)) (recording-active-p recording))
-        (finish-output *error-output*)))
     (%take-from-buffer backend "Page.screencastFrame" params)
     (when (recording-active-p recording)
       (multiple-value-bind (octets timestamp reason) (%frame-octets params)
@@ -194,11 +189,6 @@ NIL NIL reason) when the frame cannot be kept."
   (lambda (params)
     (when (equal +audio-binding-name+ (gethash "name" params))
       (%take-from-buffer backend "Runtime.bindingCalled" params)
-      (let* ((p (gethash "payload" params))
-             (cut (and (stringp p) (search ",\"pcm\"" p))))
-        (when cut
-          (format *error-output* "~&BR1CHUNK now ~,4f ~a~%" (/ (get-internal-real-time) (float internal-time-units-per-second 1d0)) (subseq p 0 cut))
-          (finish-output *error-output*)))
       (when (recording-active-p recording)
         (let ((chunk (handler-case (parse-audio-chunk (gethash "payload" params))
                        (browser-protocol:browser-error (c)
