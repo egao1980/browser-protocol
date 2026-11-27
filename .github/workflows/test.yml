@@ -10,3 +10,9 @@ on:
 jobs:
   test:
     uses: egao1980/cl-repository/.github/workflows/test-system.yml@main
+  # BR1: browser-protocol/record has its own test system. Its live tests skip
+  # without Chrome (the Ubuntu ci-base container) or ffmpeg (no runner has it).
+  record:
+    uses: egao1980/cl-repository/.github/workflows/test-system.yml@main
+    with:
+      system: browser-protocol/record
