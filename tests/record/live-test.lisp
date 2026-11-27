@@ -589,9 +589,17 @@
                          (when beep-at
                            (ok (< (abs (- (%pitch pcm (+ beep-at 0.05) :size 4096) 1000))
                                   +pitch-tolerance+)))
-                         ;; The page turns white when it hears the tone.
+                         ;; The page turns white when it hears the tone. The
+                         ;; recording starts before the navigation, and the
+                         ;; tab's about:blank is white too, so the white that
+                         ;; counts comes after the tone page's first (black)
+                         ;; frame (#13).
                          (let* ((levels (%center-levels out))
-                                (white (position-if (lambda (v) (> v 128)) levels)))
+                                (black (position-if (lambda (v) (< v 40)) levels))
+                                (white (and black
+                                            (position-if (lambda (v) (> v 128)) levels
+                                                         :start black))))
+                           (ok black "the tone page (black) was recorded")
                            (ok white "the page turned white")
                            (when (and white onset)
                              (let ((lag (- (/ white 30) onset)))
