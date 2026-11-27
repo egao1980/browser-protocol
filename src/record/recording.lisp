@@ -162,6 +162,11 @@ NIL NIL reason) when the frame cannot be kept."
 (defun %frame-handler (recording backend)
   "The Page.screencastFrame handler: keep the frame (file header), then ack it."
   (lambda (params)
+    (let ((md (gethash "metadata" params)))
+      (format *error-output* "~&BR1FRAME now ~,4f ts ~a~%"
+              (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))
+              (and (hash-table-p md) (gethash "timestamp" md)))
+      (finish-output *error-output*))
     (%take-from-buffer backend "Page.screencastFrame" params)
     (when (recording-active-p recording)
       (multiple-value-bind (octets timestamp reason) (%frame-octets params)
@@ -189,6 +194,13 @@ NIL NIL reason) when the frame cannot be kept."
   (lambda (params)
     (when (equal +audio-binding-name+ (gethash "name" params))
       (%take-from-buffer backend "Runtime.bindingCalled" params)
+      (let* ((p (gethash "payload" params))
+             (cut (and (stringp p) (search ",\"pcm\"" p))))
+        (when cut
+          (format *error-output* "~&BR1CHUNK now ~,4f ~a~%"
+                  (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))
+                  (subseq p 0 cut))
+          (finish-output *error-output*)))
       (when (recording-active-p recording)
         (let ((chunk (handler-case (parse-audio-chunk (gethash "payload" params))
                        (browser-protocol:browser-error (c)
@@ -266,7 +278,11 @@ reader thread joined (unless this is it)."
              (let ((screencast (%cdp-params "format" "jpeg" "quality" quality "everyNthFrame" 1)))
                (when max-width (setf (gethash "maxWidth" screencast) max-width))
                (when max-height (setf (gethash "maxHeight" screencast) max-height))
-               (browser-protocol:cdp-call backend "Page.startScreencast" screencast))
+               (format *error-output* "~&BR1START before ~,4f~%"
+                       (/ (get-internal-real-time) (float internal-time-units-per-second 1d0)))
+               (browser-protocol:cdp-call backend "Page.startScreencast" screencast)
+               (format *error-output* "~&BR1START after ~,4f~%"
+                       (/ (get-internal-real-time) (float internal-time-units-per-second 1d0))))
              ;; A bt2 thread sees global values only: pass the interval in.
              (let ((interval *recording-pump-interval*))
                (%with-recording-lock (recording)
