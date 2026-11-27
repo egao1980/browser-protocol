@@ -61,8 +61,10 @@ NIL. Symbolic links are followed only to test, never in the result."
        pathname))
 
 (defun %program-name (name)
-  "NAME, with .exe on Windows when it has no type."
-  (if (and (uiop:os-windows-p) (null (pathname-type (uiop:parse-unix-namestring name))))
+  "NAME, with .exe on Windows when it has no type. UIOP parses a name without
+a dot to type :UNSPECIFIC, not NIL, so both mean no type."
+  (if (and (uiop:os-windows-p)
+           (member (pathname-type (uiop:parse-unix-namestring name)) '(nil :unspecific)))
       (concatenate 'string name ".exe")
       name))
 
