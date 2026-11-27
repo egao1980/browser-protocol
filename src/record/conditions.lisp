@@ -36,15 +36,8 @@
 ;;;; reads the CDP transport (often the recording's own reader thread), so each
 ;;;; such warning is also kept, oldest first, in RECORDING-WARNINGS; it is
 ;;;; signalled with WARN (MUFFLE-WARNING) on that thread.
-;;;;
-;;;; %BR1-PENDING is the contract's stub marker: every stubbed body calls it.
 
 (in-package #:browser-protocol/record)
-
-(defun %br1-pending (name)
-  "Contract stub for slice BR1. Every call is replaced by the implementation,
-then this function is deleted."
-  (error "browser-protocol BR1 pending: ~A" name))
 
 (define-condition recording-error (browser-protocol:browser-error)
   ((recording :initarg :recording :initform nil :reader recording-error-recording))

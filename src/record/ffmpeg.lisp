@@ -53,16 +53,125 @@
 
 (in-package #:browser-protocol/record)
 
+(defun %existing-file (pathname)
+  "PATHNAME, as given, when it names an existing file (not a directory); else
+NIL. Symbolic links are followed only to test, never in the result."
+  (and pathname
+       (uiop:file-exists-p pathname)
+       pathname))
+
+(defun %program-name (name)
+  "NAME, with .exe on Windows when it has no type."
+  (if (and (uiop:os-windows-p) (null (pathname-type (uiop:parse-unix-namestring name))))
+      (concatenate 'string name ".exe")
+      name))
+
+(defun %on-path (name)
+  "The first existing file NAME in a directory of PATH, in PATH's order, as
+built (the directory merged with NAME); NIL when there is none."
+  (let ((file (uiop:parse-unix-namestring (%program-name name))))
+    (loop for dir in (uiop:split-string (or (uiop:getenv "PATH") "")
+                                        :separator (string (uiop:inter-directory-separator)))
+          for found = (and (plusp (length dir))
+                           (%existing-file
+                            (merge-pathnames file (uiop:ensure-directory-pathname
+                                                   (uiop:parse-native-namestring dir)))))
+          when found
+            return found)))
+
 (defun find-ffmpeg ()
   "The ffmpeg program to run, or NIL (file header)."
-  (%br1-pending 'find-ffmpeg))
+  (let* ((env (uiop:getenv "FFMPEG_PATH"))
+         (found (or (and env (plusp (length env))
+                         (%existing-file (uiop:parse-native-namestring env)))
+                    (%on-path "ffmpeg")
+                    (some (lambda (candidate)
+                            (%existing-file (uiop:parse-native-namestring candidate)))
+                          *ffmpeg-executable-candidates*))))
+    (and found (uiop:native-namestring found))))
+
+(defun %absolute-native (pathname)
+  "PATHNAME made absolute, as a native namestring."
+  (uiop:native-namestring (merge-pathnames (merge-pathnames pathname) (uiop:getcwd))))
 
 (defun ffmpeg-arguments (concat-file output &key (fps +default-fps+) slots audio-file)
   "The ffmpeg command line WRITE-VIDEO runs, after the program (file header)."
-  (declare (ignore concat-file output fps slots audio-file))
-  (%br1-pending 'ffmpeg-arguments))
+  (check-type fps (integer 1))
+  (check-type slots (integer 1))
+  (append (list "-nostdin" "-hide_banner" "-loglevel" "error" "-xerror" "-y"
+                "-f" "concat" "-safe" "0" "-reinit_filter" "0"
+                "-i" (%absolute-native concat-file))
+          (when audio-file
+            (list "-i" (%absolute-native audio-file) "-map" "0:v:0" "-map" "1:a:0"))
+          (list "-vf" "scale=trunc(iw/2)*2:trunc(ih/2)*2:eval=init:out_range=tv,format=yuv420p"
+                "-r" (format nil "~d" fps) "-fps_mode" "cfr" "-frames:v" (format nil "~d" slots)
+                "-c:v" "libx264" "-pix_fmt" "yuv420p")
+          (when audio-file
+            (list "-c:a" "aac" "-b:a" "128k"))
+          (list "-movflags" "+faststart" (%absolute-native output))))
+
+(defun %stderr-tail (text)
+  "The last +FFMPEG-STDERR-TAIL-LINES+ lines of TEXT, without carriage
+returns or the empty line a final newline leaves, joined with #\\Newline."
+  (let ((lines (mapcar (lambda (line)
+                         (let ((n (length line)))
+                           (if (and (plusp n) (char= #\Return (char line (1- n))))
+                               (subseq line 0 (1- n))
+                               line)))
+                       (uiop:split-string (or text "") :separator '(#\Newline)))))
+    (when (and lines (string= "" (car (last lines))))
+      (setf lines (butlast lines)))
+    (format nil "~{~a~^~%~}" (last lines +ffmpeg-stderr-tail-lines+))))
+
+(defun %resolve-program (designator)
+  "(values pathname tried): the program DESIGNATOR (a pathname designator, or
+NIL) names, or NIL when no file; TRIED is what was looked for, a native
+namestring, or NIL."
+  (if (null designator)
+      (values nil nil)
+      (let* ((pathname (if (stringp designator)
+                           (uiop:parse-native-namestring designator)
+                           (pathname designator)))
+             (tried (uiop:native-namestring pathname)))
+        (values (if (pathname-directory pathname)
+                    (%existing-file pathname)
+                    (%on-path tried))
+                tried))))
+
+(defun %run-ffmpeg-once (arguments program)
+  "Run PROGRAM (a designator, or NIL for *FFMPEG-PROGRAM* / FIND-FFMPEG) once:
+its standard error, or FFMPEG-NOT-FOUND / FFMPEG-ERROR."
+  (multiple-value-bind (pathname tried)
+      (%resolve-program (or program *ffmpeg-program* (find-ffmpeg)))
+    (unless pathname
+      (error 'ffmpeg-not-found :program tried :arguments arguments))
+    (let ((native (uiop:native-namestring pathname)))
+      (multiple-value-bind (code output stderr)
+          (handler-case (stack-process:run (cons native arguments)
+                                           :output nil :error-output :string)
+            (process-protocol:process-error (c)
+              (error 'ffmpeg-not-found
+                     :program native :arguments arguments :cause c
+                     :message (format nil "cannot start ~a: ~a" native c))))
+        (declare (ignore output))
+        (unless (eql code 0)
+          (error 'ffmpeg-error :program native :arguments arguments :exit-code code
+                               :stderr-tail (%stderr-tail stderr)))
+        stderr))))
 
 (defun run-ffmpeg (arguments &key program)
   "Run ffmpeg with ARGUMENTS; its standard error, or FFMPEG-ERROR (file header)."
-  (declare (ignore arguments program))
-  (%br1-pending 'run-ffmpeg))
+  (check-type arguments list)
+  (let ((designator program))
+    (loop
+      (restart-case (return-from run-ffmpeg (%run-ffmpeg-once arguments designator))
+        (browser-protocol::retry ()
+          :report "Run ffmpeg again, finding the program again."
+          nil)
+        (use-value (other)
+          :report "Run another ffmpeg program."
+          :interactive (lambda ()
+                         (format *query-io* "ffmpeg program: ")
+                         (force-output *query-io*)
+                         (list (read-line *query-io*)))
+          (setf designator other))))))

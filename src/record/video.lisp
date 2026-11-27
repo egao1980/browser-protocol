@@ -58,12 +58,66 @@
 
 (in-package #:browser-protocol/record)
 
+(defun %frame-time (frame)
+  "FRAME's timestamp as its exact rational."
+  (rational (recording-frame-timestamp frame)))
+
 (defun video-schedule (frames &key (fps +default-fps+) (tail 0))
   "The constant-frame-rate schedule of FRAMES (file header)."
-  (declare (ignore frames fps tail))
-  (%br1-pending 'video-schedule))
+  (check-type frames list)
+  (check-type fps (integer 1))
+  (check-type tail (real 0))
+  (when (null frames)
+    (error 'recording-no-frames))
+  ;; In time order (stable: equal timestamps keep arrival order), frame i is
+  ;; current from slot ceiling(t_i * FPS) until the next frame's first slot;
+  ;; the last frame until N. A frame whose run is empty is never shown.
+  (let* ((t0 (reduce #'min frames :key #'%frame-time))
+         (sorted (stable-sort (copy-list frames) #'< :key #'%frame-time))
+         (t-last (- (%frame-time (car (last sorted))) t0))
+         (tail (rational tail))
+         (n (max (ceiling (* (+ t-last tail) fps))
+                 (1+ (ceiling (* t-last fps))))))
+    (flet ((first-slot (frame)
+             (ceiling (* (- (%frame-time frame) t0) fps))))
+      (values (loop for (frame . rest) on sorted
+                    for from = (first-slot frame)
+                    for to = (if rest (first-slot (first rest)) n)
+                    when (> to from)
+                      collect (cons frame (- to from)))
+              n))))
+
+(defun %slot-microseconds (k fps)
+  "Microseconds slot K lasts: its boundaries rounded to whole microseconds."
+  (- (round (* (1+ k) 1000000) fps)
+     (round (* k 1000000) fps)))
+
+(defun %ffconcat-path (pathname)
+  "PATHNAME made absolute, as a native namestring quoted for an ffconcat line."
+  (let ((native (uiop:native-namestring
+                 (merge-pathnames (merge-pathnames pathname) (uiop:getcwd)))))
+    (with-output-to-string (s)
+      (write-char #\' s)
+      (loop for ch across native
+            do (if (char= ch #\')
+                   (write-string "'\\''" s)
+                   (write-char ch s)))
+      (write-char #\' s))))
 
 (defun ffconcat-text (frames &key (fps +default-fps+) (tail 0))
   "The ffmpeg concat list of FRAMES' schedule (file header)."
-  (declare (ignore frames fps tail))
-  (%br1-pending 'ffconcat-text))
+  (let ((entries (video-schedule frames :fps fps :tail tail))
+        (k 0)
+        (last-path nil))
+    (with-output-to-string (s)
+      (format s "ffconcat version 1.0~%")
+      (loop for (frame . count) in entries
+            for path = (%ffconcat-path (recording-frame-pathname frame))
+            do (loop repeat count
+                     do (multiple-value-bind (seconds micros)
+                            (floor (%slot-microseconds k fps) 1000000)
+                          (format s "file ~a~%option framerate ~d~%duration ~d.~6,'0d~%"
+                                  path fps seconds micros))
+                        (incf k))
+               (setf last-path path))
+      (format s "file ~a~%option framerate ~d~%" last-path fps))))

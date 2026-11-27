@@ -17,7 +17,7 @@
 ;;;;
 ;;;; Files (in load order):
 ;;;;   package.lisp     this package
-;;;;   conditions.lisp  the condition tree (given); %BR1-PENDING
+;;;;   conditions.lisp  the condition tree (given)
 ;;;;   model.lisp       constants, RECORDING-FRAME, AUDIO-CHUNK, AUDIO-TRACK,
 ;;;;                    AUDIO-CLIP, RECORDING and their accessors (given)
 ;;;;   video.lisp       VIDEO-SCHEDULE, FFCONCAT-TEXT: frame times to a

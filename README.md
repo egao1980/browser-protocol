@@ -42,7 +42,7 @@ JSON goes through [`json-protocol`](https://github.com/egao1980/json-protocol) (
 
 ## Record a page with sound (0.3.0, BR1)
 
-> **Contract stage.** The sources under `src/record/` are stubs whose file headers are the specification; `tests/record/` is the suite they must pass. Brief: [cl-stack `docs/capabilities/browser.md`, BR1](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/browser.md#br1-page-recording-with-sound-030).
+> **Implemented.** The file headers under `src/record/` are the specification and `tests/record/` is the suite the sources pass. Brief: [cl-stack `docs/capabilities/browser.md`, BR1](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/browser.md#br1-page-recording-with-sound-030).
 
 ```lisp
 (asdf:load-system "browser-protocol/launch")

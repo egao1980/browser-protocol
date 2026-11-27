@@ -99,35 +99,203 @@
 
 (defun decode-pcm16 (octets)
   "Signed 16-bit little-endian PCM to samples (file header)."
-  (declare (ignore octets))
-  (%br1-pending 'decode-pcm16))
+  (check-type octets (vector (unsigned-byte 8)))
+  (let ((n (length octets)))
+    (when (oddp n)
+      (error 'browser-protocol:browser-error
+             :message (format nil "~d bytes of 16-bit PCM: not a whole number of samples" n)))
+    (let ((samples (make-array (floor n 2) :element-type 'single-float)))
+      (dotimes (i (length samples) samples)
+        (let* ((lo (aref octets (* 2 i)))
+               (hi (aref octets (1+ (* 2 i))))
+               (code (+ lo (* 256 hi))))
+          (when (>= code 32768)
+            (decf code 65536))
+          (setf (aref samples i) (/ (float code 1f0) 32768f0)))))))
+
+(defun %payload-error (control &rest arguments)
+  "Signal the BROWSER-ERROR of a payload that is not a page-tap chunk."
+  (error 'browser-protocol:browser-error
+         :message (format nil "page audio payload: ~?" control arguments)))
 
 (defun parse-audio-chunk (payload)
   "The AUDIO-CHUNK of a page-tap payload (file header)."
-  (declare (ignore payload))
-  (%br1-pending 'parse-audio-chunk))
+  (unless (stringp payload)
+    (%payload-error "not a string but ~s" (type-of payload)))
+  (let ((object (handler-case (json-protocol:decode payload)
+                  (json-protocol:json-error (c)
+                    (error 'browser-protocol:browser-error
+                           :message (format nil "page audio payload: not JSON: ~a" c)
+                           :cause c)))))
+    (unless (hash-table-p object)
+      (%payload-error "not a JSON object"))
+    (flet ((field (name test what)
+             (multiple-value-bind (value present) (gethash name object)
+               (unless present
+                 (%payload-error "no \"~a\" member" name))
+               (unless (funcall test value)
+                 (%payload-error "\"~a\" is ~s, not ~a" name value what))
+               value)))
+      (field "v" (lambda (v) (eql v 1)) "1")
+      (let* ((track (field "track" (lambda (v) (and (stringp v) (plusp (length v))))
+                           "a non-empty string"))
+             (seq (field "seq" (lambda (v) (typep v '(integer 0))) "an integer >= 0"))
+             (rate (field "rate" (lambda (v) (typep v '(integer 1))) "an integer >= 1"))
+             (channels (field "channels" (lambda (v) (member v '(1 2))) "1 or 2"))
+             (frame (field "frame" #'integerp "an integer"))
+             (context-time (field "contextTime" #'realp "a number"))
+             (performance-time (field "performanceTime" #'realp "a number"))
+             (time-origin (field "timeOrigin" #'realp "a number"))
+             (pcm (field "pcm" #'stringp "a string"))
+             (octets (handler-case (encoding-protocol:decode pcm :encoding :base64)
+                       (encoding-protocol:encoding-error (c)
+                         (error 'browser-protocol:browser-error
+                                :message (format nil "page audio payload: \"pcm\" is not base64: ~a" c)
+                                :cause c))))
+             (n (length octets)))
+        (unless (and (plusp n) (zerop (mod n (* 2 channels))))
+          (%payload-error "\"pcm\" holds ~d bytes, not a positive multiple of ~d (~d channel~:p)"
+                          n (* 2 channels) channels))
+        (make-audio-chunk :track track :seq seq :sample-rate rate :channels channels
+                          :frame frame :context-time context-time
+                          :performance-time performance-time :time-origin time-origin
+                          :samples (decode-pcm16 octets))))))
 
 (defun chunk-epoch (chunk)
   "Seconds since 1970 at which CHUNK's first sample is heard (file header)."
-  (declare (ignore chunk))
-  (%br1-pending 'chunk-epoch))
+  (check-type chunk audio-chunk)
+  (+ (/ (+ (rational (audio-chunk-time-origin chunk))
+           (rational (audio-chunk-performance-time chunk)))
+        1000)
+     (/ (audio-chunk-frame chunk) (audio-chunk-sample-rate chunk))
+     (- (rational (audio-chunk-context-time chunk)))))
+
+(defun %recording-warn (recording reason)
+  "Keep a RECORDING-WARNING (REASON) in RECORDING's warnings, then WARN it,
+with the recording's lock released: a handler of the warning may read the
+recording."
+  (let ((warning (make-condition 'recording-warning :recording recording :reason reason)))
+    (%with-recording-lock (recording)
+      (push warning (%recording-warnings recording)))
+    (warn warning)
+    nil))
 
 (defun add-audio-chunk (recording chunk)
   "File CHUNK into its track of RECORDING (file header)."
-  (declare (ignore recording chunk))
-  (%br1-pending 'add-audio-chunk))
+  (check-type recording recording)
+  (check-type chunk audio-chunk)
+  (let ((mismatch nil)
+        (result nil))
+    (%with-recording-lock (recording)
+      (let* ((id (audio-chunk-track chunk))
+             (track (or (find id (%recording-tracks recording)
+                              :key #'audio-track-id :test #'string=)
+                        (let ((new (%make-audio-track id (audio-chunk-sample-rate chunk)
+                                                      (audio-chunk-channels chunk))))
+                          (push new (%recording-tracks recording))
+                          new))))
+        (cond
+          ((or (/= (audio-chunk-sample-rate chunk) (audio-track-sample-rate track))
+               (/= (audio-chunk-channels chunk) (audio-track-channels track)))
+           (setf mismatch
+                 (format nil "an audio chunk of track ~a at ~d Hz, ~d channel~:p (the track has ~d Hz, ~d channel~:p)"
+                         id (audio-chunk-sample-rate chunk) (audio-chunk-channels chunk)
+                         (audio-track-sample-rate track) (audio-track-channels track))))
+          ((find (audio-chunk-seq chunk) (audio-track-chunks track) :key #'audio-chunk-seq)
+           (setf result track))
+          (t
+           ;; A fresh list: readers take AUDIO-TRACK-CHUNKS without the lock.
+           (setf (audio-track-chunks track)
+                 (merge 'list (copy-list (audio-track-chunks track)) (list chunk)
+                        #'< :key #'audio-chunk-seq)
+                 result track)))))
+    (when mismatch
+      (%recording-warn recording mismatch))
+    result))
 
 (defun track-buffer (track)
   "TRACK's chunks as one buffer, and the epoch of its first frame (file header)."
-  (declare (ignore track))
-  (%br1-pending 'track-buffer))
+  (check-type track audio-track)
+  (let ((chunks (stable-sort (copy-list (audio-track-chunks track)) #'< :key #'audio-chunk-seq)))
+    (if (null chunks)
+        (values nil nil)
+        (let* ((channels (audio-track-channels track))
+               (rate (audio-track-sample-rate track))
+               (f0 (reduce #'min chunks :key #'audio-chunk-frame))
+               (f1 (reduce #'max chunks :key (lambda (c) (+ (audio-chunk-frame c)
+                                                            (audio-chunk-frames c)))))
+               (buffer (audio-protocol:make-pcm-buffer :sample-rate rate :channels channels
+                                                       :frames (- f1 f0)))
+               (samples (audio-protocol:pcm-buffer-samples buffer))
+               (r (first chunks)))
+          (dolist (chunk chunks)
+            (replace samples (audio-chunk-samples chunk)
+                     :start1 (* channels (- (audio-chunk-frame chunk) f0))))
+          (values buffer
+                  (+ (chunk-epoch r) (/ (- f0 (audio-chunk-frame r)) rate)))))))
+
+(defun %shifted (buffer offset frames)
+  "A fresh buffer of FRAMES frames, BUFFER's rate and channels: BUFFER's frame
+j at frame j + OFFSET, silence elsewhere."
+  (let* ((channels (audio-protocol:pcm-buffer-channels buffer))
+         (out (audio-protocol:make-pcm-buffer
+               :sample-rate (audio-protocol:pcm-buffer-sample-rate buffer)
+               :channels channels :frames frames))
+         (src (max 0 (- offset)))
+         (dst (max 0 offset))
+         (count (min (- (audio-protocol:pcm-buffer-frames buffer) src) (- frames dst))))
+    (when (plusp count)
+      (replace (audio-protocol:pcm-buffer-samples out) (audio-protocol:pcm-buffer-samples buffer)
+               :start1 (* dst channels)
+               :start2 (* src channels) :end2 (* (+ src count) channels)))
+    out))
+
+(defun %stereo-at-unity (buffer)
+  "BUFFER with 2 channels: a mono buffer's channel on both sides at unity,
+any other buffer as it is."
+  (if (= 1 (audio-protocol:pcm-buffer-channels buffer))
+      (let ((channel (audio-protocol:pcm-channel buffer 0)))
+        (audio-protocol:pcm-from-channels (list channel channel)
+                                          :sample-rate (audio-protocol:pcm-buffer-sample-rate buffer)))
+      buffer))
 
 (defun mix-placed (placements &key (sample-rate +default-sample-rate+) frames)
   "Buffers placed at start times, summed into one stereo buffer (file header)."
-  (declare (ignore placements sample-rate frames))
-  (%br1-pending 'mix-placed))
+  (check-type placements list)
+  (check-type sample-rate (integer 1))
+  (check-type frames (or null (integer 0)))
+  (when placements
+    (let* ((placed
+             (loop for (buffer . start) in placements
+                   for at-rate = (if (= (audio-protocol:pcm-buffer-sample-rate buffer) sample-rate)
+                                     buffer
+                                     (audio-protocol:resample buffer sample-rate))
+                   for stereo = (%stereo-at-unity at-rate)
+                   for offset = (floor (+ (* (rational start) sample-rate) 1/2))
+                   collect (%shifted stereo offset
+                                     (max 0 (+ offset (audio-protocol:pcm-buffer-frames stereo))))))
+           (sum (audio-protocol:mix placed :channels 2 :clip :clip)))
+      (if (and frames (/= frames (audio-protocol:pcm-buffer-frames sum)))
+          (%shifted sum 0 frames)
+          sum))))
 
 (defun mix-recording (recording &key (sample-rate +default-sample-rate+) frames start)
   "RECORDING's page audio and clips mixed on its clock (file header)."
-  (declare (ignore recording sample-rate frames start))
-  (%br1-pending 'mix-recording))
+  (check-type recording recording)
+  (check-type start (or null real))
+  (let ((t0 (let ((origin (or start (recording-start-time recording))))
+              (unless origin
+                (error 'recording-no-frames :recording recording))
+              (rational origin)))
+        (placements '()))
+    (dolist (track (recording-audio-tracks recording))
+      (multiple-value-bind (buffer track-start) (track-buffer track)
+        (when buffer
+          (push (cons buffer (- track-start t0)) placements))))
+    (dolist (clip (recording-audio-clips recording))
+      (push (cons (audio-clip-buffer clip)
+                  (if (audio-clip-epoch clip)
+                      (- (rational (audio-clip-epoch clip)) t0)
+                      (rational (audio-clip-at clip))))
+            placements))
+    (mix-placed (nreverse placements) :sample-rate sample-rate :frames frames)))
