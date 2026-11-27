@@ -70,6 +70,28 @@ NIL. Symbolic links are followed only to test, never in the result."
   "The first existing file NAME in a directory of PATH, in PATH's order, as
 built (the directory merged with NAME); NIL when there is none."
   (let ((file (uiop:parse-unix-namestring (%program-name name))))
+    (when (uiop:os-windows-p)
+      (let ((path (or (uiop:getenv "PATH") "")))
+        (format *error-output* "~&BR1DIAG PATH length ~d head ~s~%" (length path)
+                (subseq path 0 (min 300 (length path))))
+        (format *error-output* "~&BR1DIAG file ~s components ~s~%" file
+                (list (pathname-host file) (pathname-device file) (pathname-directory file)
+                      (pathname-name file) (pathname-type file) (pathname-version file)))
+        (loop for dir in (uiop:split-string path :separator (string (uiop:inter-directory-separator)))
+              for i below 3
+              do (let* ((d (ignore-errors (uiop:ensure-directory-pathname
+                                           (uiop:parse-native-namestring dir))))
+                        (p (and d (merge-pathnames file d))))
+                   (format *error-output* "~&BR1DIAG dir ~s d ~s p ~s~%  comps ~s~%  wild ~s probe ~s exists ~s probe* ~s dirp ~s~%"
+                           dir d p
+                           (and p (list (pathname-host p) (pathname-device p) (pathname-directory p)
+                                        (pathname-name p) (pathname-type p) (pathname-version p)))
+                           (and p (wild-pathname-p p))
+                           (and p (multiple-value-list (ignore-errors (probe-file p))))
+                           (and p (multiple-value-list (ignore-errors (uiop:file-exists-p p))))
+                           (and p (multiple-value-list (ignore-errors (uiop:probe-file* p))))
+                           (and d (multiple-value-list (ignore-errors (uiop:directory-exists-p d)))))))
+        (finish-output *error-output*)))
     (loop for dir in (uiop:split-string (or (uiop:getenv "PATH") "")
                                         :separator (string (uiop:inter-directory-separator)))
           for found = (and (plusp (length dir))
