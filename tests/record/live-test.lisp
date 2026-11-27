@@ -109,8 +109,8 @@
 ;;; and check the captured audio run only where the OS reports an audio output
 ;;; device. Without one Chrome plays into a fake output whose timing stalls
 ;;; (the GitHub runners: browser-protocol#15, #16; the macOS runner is a VM
-;;; whose only output devices are virtual), so there is no page audio to
-;;; check. BROWSER_PROTOCOL_AUDIO_TESTS overrides the detection: 1 runs these
+;;; whose output devices are the hypervisor's and a loopback driver), so
+;;; there is no page audio to check. BROWSER_PROTOCOL_AUDIO_TESTS overrides the detection: 1 runs these
 ;;; tests, 0 skips them.
 
 (defparameter +audio-tests-variable+ "BROWSER_PROTOCOL_AUDIO_TESTS")
@@ -125,12 +125,23 @@
            (subseq transport (length prefix)))
           (t transport))))
 
+(defun %macos-virtual-machine-p ()
+  "True when macOS runs under a hypervisor (sysctl kern.hv_vmm_present)."
+  (handler-case (string= "1" (string-trim '(#\Space #\Newline #\Return)
+                                          (%run "sysctl" "-n" "kern.hv_vmm_present")))
+    (error () nil)))
+
 (defun %macos-audio-outputs ()
   "macOS: system_profiler's audio devices. -> (values output-p description).
    An output device has output channels or is the default output, and is
-   hardware: a virtual transport (a VM's sound device, a loopback driver such
-   as the Null Audio Device), an aggregate or an unknown one does not count."
-  (let* ((json (json-protocol:decode (%run "system_profiler" "SPAudioDataType" "-json")))
+   hardware: a virtual transport (a loopback driver such as the Null Audio
+   Device), an aggregate or an unknown one does not count. Nor, in a VM, does
+   a builtin one: that is the hypervisor's sound device (the macOS runner's
+   Apple Virtual Sound Device reports builtin); a USB or other external
+   device passed through still counts."
+  (let* ((vm (%macos-virtual-machine-p))
+         (not-hardware (append (and vm '("builtin")) '("virtual" "aggregate" "unknown")))
+         (json (json-protocol:decode (%run "system_profiler" "SPAudioDataType" "-json")))
          (items (loop for group across (or (gethash "SPAudioDataType" json) #())
                       append (coerce (or (gethash "_items" group) #()) 'list)))
          (devices (mapcar (lambda (item)
@@ -146,12 +157,11 @@
                      (destructuring-bind (name channels transport default) device
                        (declare (ignore name))
                        (and (or (plusp channels) default)
-                            (not (member transport '("virtual" "aggregate" "unknown")
-                                         :test #'string=)))))
+                            (not (member transport not-hardware :test #'string=)))))
                    devices)))
     (values (and outputs t)
-            (format nil "system_profiler SPAudioDataType: ~d device~:p~:{, ~a (~a output channels, ~a~:[~;, default output~])~}"
-                    (length devices) devices))))
+            (format nil "~:[~;a VM, so builtin devices are virtual; ~]system_profiler SPAudioDataType: ~d device~:p~:{, ~a (~a output channels, ~a~:[~;, default output~])~}"
+                    vm (length devices) devices))))
 
 (defparameter +windows-audio-query+
   "$ProgressPreference = 'SilentlyContinue'; $render = @(Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render' -ErrorAction SilentlyContinue | Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DeviceState -eq 1 }).Count; $sound = @(Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue).Count; Write-Output ([string]$render + ' ' + [string]$sound)"
